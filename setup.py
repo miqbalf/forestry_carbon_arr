@@ -60,11 +60,6 @@ setup(
             "mypy>=1.7.0",
         ],
     },
-    entry_points={
-        "console_scripts": [
-            "forestry-carbon-arr=forestry_carbon_arr.cli:main",
-        ],
-    },
     include_package_data=True,
     package_data={
         "forestry_carbon_arr": [
