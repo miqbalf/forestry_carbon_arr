@@ -246,13 +246,20 @@ class ForestryCarbonARR:
                     - treeLoss: Direct access to tree loss mask (years 0-23, masked)
                     - minLoss: Direct access to minimum loss image
                     - list_images_classified: FCD-based classification results
+                    - fcd_classified_zone: FCD-based zone classification image (before ML overlay)
+                    - zones_all_algorithms: Dictionary with zone classifications for all ML algorithms:
+                        - 'rf': Zone classification using Random Forest land cover
+                        - 'svm': Zone classification using SVM land cover
+                        - 'gbm': Zone classification using GBM land cover
+                        - 'cart': Zone classification using CART land cover
                     - HighForestDense: High forest density mask
                     - layer_names: Dictionary with standardized layer names for all outputs:
                         - image_mosaick: Layer name for mosaicked satellite image
                         - FCD1_1, FCD2_1: Layer names for Forest Canopy Density images
                         - treeLossYear, treeLoss, minLoss: Layer names for Hansen historical loss
                         - fcd_classified_zone: Layer name for FCD-based zone classification
-                        - final_zone: Layer name for final zone classification
+                        - final_zone: Layer name for final zone classification (selected algorithm)
+                        - zone_rf, zone_svm, zone_gbm, zone_cart: Layer names for zone classifications by ML algorithm
                         - land_cover_rf, land_cover_svm, land_cover_gbm, land_cover_cart: Layer names for ML classifiers
                         - land_cover_selected: Layer name for selected ML algorithm result
                 - visualization_params: Dictionary with visualization parameters (direct access):
@@ -612,15 +619,40 @@ class ForestryCarbonARR:
             
             list_images_classified = class_assigning_fcd.assigning_fcd_class(gfc, minLoss)
             HighForestDense = list_images_classified['HighForestDense']
+            fcd_classified_zone = list_images_classified['all_zone']  # FCD-based zone classification (before ML overlay)
             
-            # Step 13: Final zone assignment (ML + FCD + Hansen)
-            self.logger.info("Computing final zone classification...")
-            final_zone = class_assigning_fcd.assign_zone_ml(
-                selected_image_lc,
+            # Step 13: Final zone assignment (ML + FCD + Hansen) for all ML algorithms
+            self.logger.info("Computing final zone classification for all ML algorithms...")
+            
+            # Generate zone classifications for all ML algorithms
+            zones_all_algorithms = {}
+            zones_all_algorithms['rf'] = class_assigning_fcd.assign_zone_ml(
+                classifier['classified_image_rf'],
                 minLoss,
                 AOI_img,
                 HighForestDense
             )
+            zones_all_algorithms['svm'] = class_assigning_fcd.assign_zone_ml(
+                classifier['classified_image_svm'],
+                minLoss,
+                AOI_img,
+                HighForestDense
+            )
+            zones_all_algorithms['gbm'] = class_assigning_fcd.assign_zone_ml(
+                classifier['classified_image_gbm'],
+                minLoss,
+                AOI_img,
+                HighForestDense
+            )
+            zones_all_algorithms['cart'] = class_assigning_fcd.assign_zone_ml(
+                classifier['classified_image_cart'],
+                minLoss,
+                AOI_img,
+                HighForestDense
+            )
+            
+            # Get the selected algorithm's zone
+            final_zone = zones_all_algorithms[algo_ml_selected]
             
             # Get visualization parameters for zones (from AssignClassZone)
             vis_param_zone = class_assigning_fcd.vis_param_merged
@@ -666,7 +698,6 @@ class ForestryCarbonARR:
             }
             
             # Generate standardized layer names
-            
             layer_names = {
                 'image_mosaick': f'{I_satellite} mosaicked - {start_date}-{end_date} VegColor',
                 'FCD1_1': f'FCD1_1_{project_name}',
@@ -676,6 +707,10 @@ class ForestryCarbonARR:
                 'minLoss': 'minLoss',
                 'fcd_classified_zone': f'FCD_classified_zone_{project_name}',
                 'final_zone': f'Final_zone_ML_{algo_ml_selected}_Hansen',
+                'zone_rf': f'Final_zone_ML_rf_Hansen',
+                'zone_svm': f'Final_zone_ML_svm_Hansen',
+                'zone_gbm': f'Final_zone_ML_gbm_Hansen',
+                'zone_cart': f'Final_zone_ML_cart_Hansen',
                 'land_cover_rf': 'Random_forest_lc_result',
                 'land_cover_svm': 'SVM_lc_result',
                 'land_cover_gbm': 'GBM_lc_result',
@@ -699,7 +734,9 @@ class ForestryCarbonARR:
                 'treeLossYear': treeLossYear,  # Direct access to treeLossYear
                 'treeLoss': treeLoss,  # Direct access to treeLoss (masked tree loss 0-23 years)
                 'minLoss': minLoss,  # Direct access to minLoss
-                'list_images_classified': list_images_classified,
+                'list_images_classified': list_images_classified,  # FCD-based classification results
+                'fcd_classified_zone': fcd_classified_zone,  # FCD-based zone classification (before ML overlay)
+                'zones_all_algorithms': zones_all_algorithms,  # Zone classifications for all ML algorithms (rf, svm, gbm, cart)
                 'HighForestDense': HighForestDense,
                 'layer_names': layer_names  # Standardized layer names for visualization/export
             }
