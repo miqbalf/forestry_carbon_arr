@@ -762,12 +762,16 @@ class ForestryCarbonARR:
                              zarr_path: Optional[str] = None,
                              use_existing_asset: bool = False,
                              asset_folder: Optional[str] = None,
+                             asset_is_monthly_composites: bool = False,
+                             use_processed_asset: bool = False,
+                             processed_asset_path: Optional[str] = None,
                              years_back: int = 10,
                              pixel_scale: Optional[int] = None,
                              chunk_sizes: Optional[Dict[str, int]] = None,
                              compression: str = 'lz4',
                              compression_level: int = 1,
                              overwrite_zarr: bool = False,
+                             save_to_zarr: bool = True,
                              storage: str = 'auto',
                              **kwargs) -> 'xr.Dataset':
         """
@@ -798,6 +802,12 @@ class ForestryCarbonARR:
                 Default False.
             asset_folder: GEE asset folder path (e.g., 'projects/xxx/assets/yyy').
                 Required if use_existing_asset=True.
+            asset_is_monthly_composites: If True (and use_existing_asset=True), the asset contains
+                monthly composites, so skip cloud filtering and compositing steps. Default False.
+            use_processed_asset: If True, load the final processed ImageCollection (with indices and smoothing)
+                directly from a GEE asset, skipping all processing steps. Default False.
+            processed_asset_path: GEE asset path to the processed ImageCollection (e.g., 
+                'projects/xxx/assets/yyy/processed_collection'). Required if use_processed_asset=True.
             years_back: Number of years to look back from end_date for historical data.
                 Default 10.
             pixel_scale: Pixel scale in meters. If None, auto-detects based on satellite type.
@@ -806,6 +816,8 @@ class ForestryCarbonARR:
             compression: Compression algorithm ('lz4', 'blosc', 'zstd', or None). Default 'lz4'.
             compression_level: Compression level (1-9). Default 1 (fastest).
             overwrite_zarr: Whether to overwrite existing zarr store. Default False.
+            save_to_zarr: Whether to save dataset to zarr (GCS or local). If False, returns dataset directly
+                from GEE without saving. Default True. Set to False to avoid GCS zarr export.
             storage: Storage type ('auto', 'local', 'gcs'). Default 'auto'.
             **kwargs: Additional keyword arguments passed to xr.open_dataset.
             
@@ -860,67 +872,126 @@ class ForestryCarbonARR:
         data_utils = DataUtils(config, use_gee=True)
         aoi_gpd, aoi_ee = data_utils.load_geodataframe_gee(config['AOI_path'])
         
-        # Step 2: Create ImageCollection and prepare (UTM + reproject)
-        self.logger.info("Creating ImageCollection and preparing for processing...")
-        raw_collection, utm_crs, pixel_scale_auto, utm_epsg = prepare_image_collection_for_processing(
-            config=config,
-            aoi_gpd=aoi_gpd,
-            aoi_ee=aoi_ee,
-            years_back=years_back,
-            use_existing_asset=use_existing_asset,
-            asset_folder=asset_folder,
-            import_strategy=self.import_strategy,
-            reproject_to_utm_flag=True
-        )
+        # Check if we should load processed collection directly from GEE asset
+        if use_processed_asset:
+            if processed_asset_path is None:
+                raise ValueError("processed_asset_path is required when use_processed_asset=True")
+            
+            self.logger.info(f"Loading processed ImageCollection from GEE asset: {processed_asset_path}")
+            collection_with_sg = ee.ImageCollection(processed_asset_path)
+            
+            # Get UTM CRS and pixel scale from config or auto-detect
+            if 'utm_crs' in config:
+                utm_crs = config['utm_crs']
+            else:
+                # Auto-detect UTM CRS
+                from ..utils.gee_processing import calculate_utm_crs
+                utm_crs, utm_epsg, hemisphere = calculate_utm_crs(aoi_gpd)
+                config['utm_crs'] = utm_crs
+            
+            if pixel_scale is None:
+                from ..utils.gee_processing import get_pixel_scale
+                pixel_scale = get_pixel_scale(config.get('I_satellite', 'Sentinel'))
+            
+            self.logger.info(f"Using processed asset. UTM CRS: {utm_crs}, Pixel scale: {pixel_scale}m")
+        else:
+            # Check if asset contains monthly composites
+            if use_existing_asset and asset_is_monthly_composites:
+                self.logger.info(f"Loading monthly composites from GEE asset: {asset_folder}")
+                self.logger.info(f"  use_existing_asset={use_existing_asset}, asset_is_monthly_composites={asset_is_monthly_composites}")
+                
+                # Load asset directly as monthly composites
+                collection_monthly_raw = ee.ImageCollection(asset_folder)
+                
+                # IMPORTANT: Rename bands immediately (remove _median suffix, exclude cloudM)
+                # This is needed because the asset has bands like blue_median, but processing expects blue
+                self.logger.info("Renaming bands (removing _median suffix)...")
+                collection_monthly = rename_composite_bands(
+                    collection_monthly_raw,
+                    remove_suffix='_median',
+                    exclude_bands=['cloudM']
+                )
+                
+                # Get UTM CRS and pixel scale from config or auto-detect
+                if 'utm_crs' in config:
+                    utm_crs = config['utm_crs']
+                else:
+                    from ..utils.gee_processing import calculate_utm_crs
+                    utm_crs, utm_epsg, hemisphere = calculate_utm_crs(aoi_gpd)
+                    config['utm_crs'] = utm_crs
+                
+                if pixel_scale is None:
+                    from ..utils.gee_processing import get_pixel_scale
+                    pixel_scale = get_pixel_scale(config.get('I_satellite', 'Sentinel'))
+                
+                self.logger.info(f"✅ Loaded {collection_monthly.size().getInfo()} monthly composite images")
+                self.logger.info(f"UTM CRS: {utm_crs}, Pixel scale: {pixel_scale}m")
+                
+            else:
+                # Step 2: Create ImageCollection and prepare (UTM + reproject)
+                self.logger.info("Creating ImageCollection and preparing for processing...")
+                raw_collection, utm_crs, pixel_scale_auto, utm_epsg = prepare_image_collection_for_processing(
+                    config=config,
+                    aoi_gpd=aoi_gpd,
+                    aoi_ee=aoi_ee,
+                    years_back=years_back,
+                    use_existing_asset=use_existing_asset,
+                    asset_folder=asset_folder,
+                    import_strategy=self.import_strategy,
+                    reproject_to_utm_flag=True
+                )
+                
+                # Use provided pixel_scale or auto-detected
+                if pixel_scale is None:
+                    pixel_scale = pixel_scale_auto
+                
+                config['utm_crs'] = utm_crs
+                self.logger.info(f"UTM CRS: {utm_crs}, Pixel scale: {pixel_scale}m")
+                
+                # Step 3: Filter by cloud cover
+                self.logger.info("Filtering by cloud cover...")
+                aoi_gpd_utm = aoi_gpd.to_crs(utm_crs)
+                aoi_ee_utm_geom = geemap.geopandas_to_ee(aoi_gpd_utm).geometry()
+                aoi_bounds_utm = aoi_ee_utm_geom.bounds(maxError=1)
+                
+                valid_pixel_threshold = config.get('valid_pixel_threshold', 70.0)
+                collection_filtered, stats = filter_by_cloud_cover(
+                    raw_collection,
+                    aoi_bounds_utm,
+                    scale=pixel_scale,
+                    crs=utm_crs,
+                    valid_pixel_threshold=valid_pixel_threshold
+                )
+                
+                # Step 4: Create monthly composites and rename bands
+                self.logger.info("Creating monthly composites...")
+                monthly_images = create_monthly_composites(
+                    collection_filtered,
+                    aoi_ee.geometry(),
+                    reducer='median'
+                )
+                
+                collection_monthly_raw = ee.ImageCollection(monthly_images).sort('system:time_start')
+                collection_monthly = rename_composite_bands(
+                    collection_monthly_raw,
+                    remove_suffix='_median',
+                    exclude_bands=['cloudM']
+                )
+            
+            # Step 5: Add spectral indices and apply smoothing
+            self.logger.info("Adding spectral indices and applying smoothing...")
+            collection_with_sg = process_collection_with_indices_and_smoothing(
+                collection=collection_monthly,
+                config=config,
+                aoi_ee=aoi_ee,
+                spectral_bands=['NDVI', 'EVI'],
+                smoothing_window=3,
+                smoothing_polyorder=2,
+                add_fcd=False
+            )
         
-        # Use provided pixel_scale or auto-detected
-        if pixel_scale is None:
-            pixel_scale = pixel_scale_auto
-        
-        config['utm_crs'] = utm_crs
-        self.logger.info(f"UTM CRS: {utm_crs}, Pixel scale: {pixel_scale}m")
-        
-        # Step 3: Filter by cloud cover
-        self.logger.info("Filtering by cloud cover...")
+        # Prepare AOI geometry for xee conversion
         aoi_gpd_utm = aoi_gpd.to_crs(utm_crs)
-        aoi_ee_utm_geom = geemap.geopandas_to_ee(aoi_gpd_utm).geometry()
-        aoi_bounds_utm = aoi_ee_utm_geom.bounds(maxError=1)
-        
-        valid_pixel_threshold = config.get('valid_pixel_threshold', 70.0)
-        collection_filtered, stats = filter_by_cloud_cover(
-            raw_collection,
-            aoi_bounds_utm,
-            scale=pixel_scale,
-            crs=utm_crs,
-            valid_pixel_threshold=valid_pixel_threshold
-        )
-        
-        # Step 4: Create monthly composites and rename bands
-        self.logger.info("Creating monthly composites...")
-        monthly_images = create_monthly_composites(
-            collection_filtered,
-            aoi_ee.geometry(),
-            reducer='median'
-        )
-        
-        collection_monthly_raw = ee.ImageCollection(monthly_images).sort('system:time_start')
-        collection_monthly = rename_composite_bands(
-            collection_monthly_raw,
-            remove_suffix='_median',
-            exclude_bands=['cloudM']
-        )
-        
-        # Step 5: Add spectral indices and apply smoothing
-        self.logger.info("Adding spectral indices and applying smoothing...")
-        collection_with_sg = process_collection_with_indices_and_smoothing(
-            collection=collection_monthly,
-            config=config,
-            aoi_ee=aoi_ee,
-            spectral_bands=['NDVI', 'EVI'],
-            smoothing_window=3,
-            smoothing_polyorder=2,
-            add_fcd=False
-        )
         
         # Step 6: Convert to xarray using xee
         self.logger.info("Converting GEE ImageCollection to xarray using xee...")
@@ -936,7 +1007,13 @@ class ForestryCarbonARR:
         
         self.logger.info(f"Dataset created: {dict(ds.dims)}")
         
-        # Step 7: Determine zarr path
+        # Step 7: Save to zarr or return directly
+        if not save_to_zarr:
+            self.logger.info("Skipping zarr save - returning dataset directly from GEE")
+            self.logger.warning("⚠️  Dataset is still lazy-loaded from GEE. Accessing data may cause 'Too many concurrent aggregations' errors.")
+            return ds
+        
+        # Step 8: Determine zarr path
         if zarr_path is None:
             zarr_path = os.getenv('GCS_ZARR_DIR', '')
             if not zarr_path:
@@ -945,7 +1022,7 @@ class ForestryCarbonARR:
             else:
                 zarr_path = os.path.join(zarr_path, 'ds_resampled.zarr')
         
-        # Step 8: Save or load from zarr
+        # Step 9: Save or load from zarr
         if storage == 'auto':
             storage = 'gcs' if zarr_path.startswith('gs://') else 'local'
         
