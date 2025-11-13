@@ -32,6 +32,14 @@ from .gee_processing import (
     interpolate_temporal_gaps,
     savgol_filter
 )
+from .tsfresh_utils import (
+    standardize_to_stac_convention,
+    load_ground_truth_data,
+    get_raster_mask_with_layer,
+    parallel_rasterize_with_layer,
+    merge_all_masks_4d,
+    prepare_tsfresh_data_with_ground_truth
+)
 
 __all__ = [
     'DependencyManager', 
@@ -60,5 +68,11 @@ __all__ = [
     'process_collection_with_indices_and_smoothing',
     'remove_drops_and_spikes_gee',
     'interpolate_temporal_gaps',
-    'savgol_filter'
+    'savgol_filter',
+    'load_ground_truth_data',
+    'get_raster_mask_with_layer',
+    'parallel_rasterize_with_layer',
+    'merge_all_masks_4d',
+    'standardize_to_stac_convention',
+    'prepare_tsfresh_data_with_ground_truth'
 ]

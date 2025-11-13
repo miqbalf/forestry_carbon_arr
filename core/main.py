@@ -6,7 +6,7 @@ import os
 import sys
 import logging
 from pathlib import Path
-from typing import Optional, Dict, Any, Union, TYPE_CHECKING
+from typing import Optional, Dict, Any, Union, List, TYPE_CHECKING
 from datetime import datetime
 
 if TYPE_CHECKING:
@@ -1065,6 +1065,156 @@ class ForestryCarbonARR:
         
         self.logger.info("GEE to xarray conversion workflow completed successfully!")
         return ds_raw
+    
+    def prepare_tsfresh_with_ground_truth(
+        self,
+        ds_resampled: Optional['xr.Dataset'] = None,
+        ground_truth_path: Optional[str] = None,
+        ground_truth_gdf: Optional[Any] = None,
+        buffer_pixels: int = 50,
+        chunk_sizes: Optional[Dict[str, int]] = None,
+        save_to_zarr: bool = True,
+        zarr_path: Optional[str] = None,
+        overwrite_zarr: bool = False,
+        storage: str = 'auto'
+    ) -> List['xr.Dataset']:
+        """
+        Prepare satellite data with ground truth labels for tsfresh feature extraction.
+        
+        This method:
+        1. Loads ground truth training data (polygons)
+        2. Clips satellite data to sample bounding boxes
+        3. Converts training polygons to raster masks
+        4. Merges masks into 4D dataset (plot_id, time, y, x)
+        5. Merges satellite data with ground truth labels
+        6. Optionally saves to zarr
+        
+        Args:
+            ds_resampled: Satellite dataset from get_ds_resampled_gee(). If None, will call
+                get_ds_resampled_gee() automatically.
+            ground_truth_path: Path to ground truth parquet file (GCS or local).
+                Required if ground_truth_gdf is None.
+            ground_truth_gdf: Pre-loaded GeoDataFrame with ground truth data.
+                Required if ground_truth_path is None.
+            buffer_pixels: Buffer size in pixels around sample bounding boxes. Default 50.
+            chunk_sizes: Chunk sizes for output dataset. Default: {'plot_id': 1, 'time': 20, 'x': 128, 'y': 128}
+            save_to_zarr: Whether to save datasets to zarr. Default True.
+            zarr_path: Base path for zarr stores. If None, uses GCS_ZARR_DIR env var.
+            overwrite_zarr: Whether to overwrite existing zarr stores. Default False.
+            storage: Storage type ('auto', 'local', 'gcs'). Default 'auto'.
+        
+        Returns:
+            List of xarray.Dataset, one per sample (layer), each with:
+            - Dimensions: (plot_id, time, x, y)
+            - Variables: [EVI, NDVI, ground_truth, gt_valid]
+        """
+        import geopandas as gpd
+        from ..utils.tsfresh_utils import (
+            load_ground_truth_data,
+            prepare_tsfresh_data_with_ground_truth
+        )
+        from ..utils.zarr_utils import save_dataset_efficient_zarr, load_dataset_zarr
+        import os
+        
+        self.logger.info("=" * 60)
+        self.logger.info("Preparing tsfresh data with ground truth")
+        self.logger.info("=" * 60)
+        
+        # Step 1: Get ds_resampled if not provided
+        if ds_resampled is None:
+            self.logger.info("ds_resampled not provided, calling get_ds_resampled_gee()...")
+            ds_resampled = self.get_ds_resampled_gee(save_to_zarr=False)
+        
+        # Step 2: Load ground truth data
+        if ground_truth_gdf is None:
+            if ground_truth_path is None:
+                raise ValueError("Either ground_truth_path or ground_truth_gdf must be provided")
+            
+            # Determine if GCS or local
+            if ground_truth_path.startswith('gs://'):
+                training_gdf = load_ground_truth_data(gcs_path=ground_truth_path)
+            else:
+                training_gdf = load_ground_truth_data(local_path=ground_truth_path)
+        else:
+            training_gdf = ground_truth_gdf
+            self.logger.info(f"Using provided ground truth GeoDataFrame: {len(training_gdf)} polygons")
+        
+        # Step 3: Prepare tsfresh data with ground truth
+        self.logger.info("Preparing tsfresh data with ground truth labels...")
+        ds_gt_list = prepare_tsfresh_data_with_ground_truth(
+            ds_resampled=ds_resampled,
+            training_gdf=training_gdf,
+            buffer_pixels=buffer_pixels,
+            chunk_sizes=chunk_sizes
+        )
+        
+        # Step 4: Save to zarr if requested
+        if save_to_zarr:
+            self.logger.info("Saving datasets to zarr...")
+            
+            # Determine zarr path
+            if zarr_path is None:
+                zarr_path = os.getenv('GCS_ZARR_DIR', '')
+                if not zarr_path:
+                    zarr_path = os.path.join(os.getcwd(), 'data', 'tsfresh_gt')
+                else:
+                    if not zarr_path.startswith('gs://'):
+                        zarr_path = f"gs://{zarr_path}/tsfresh_gt"
+                    else:
+                        zarr_path = f"{zarr_path}/tsfresh_gt"
+            
+            # Determine storage
+            if storage == 'auto':
+                storage = 'gcs' if zarr_path.startswith('gs://') else 'local'
+            
+            # Save each sample dataset
+            saved_datasets = []
+            for i, ds_gt in enumerate(ds_gt_list):
+                plot_id = ds_gt.coords['plot_id'].values[0] if 'plot_id' in ds_gt.coords else f'sample_{i+1}'
+                sample_zarr_path = f"{zarr_path}/{plot_id}.zarr"
+                
+                self.logger.info(f"Saving {plot_id} to: {sample_zarr_path}")
+                
+                # Check if exists
+                zarr_exists = False
+                if storage == 'gcs':
+                    try:
+                        import gcsfs
+                        fs = gcsfs.GCSFileSystem(project=os.getenv('GOOGLE_CLOUD_PROJECT'))
+                        zarr_exists = fs.exists(sample_zarr_path)
+                    except Exception:
+                        zarr_exists = False
+                else:
+                    zarr_exists = os.path.exists(sample_zarr_path)
+                
+                if zarr_exists and not overwrite_zarr:
+                    self.logger.info(f"Loading existing zarr: {sample_zarr_path}")
+                    ds_gt_loaded = load_dataset_zarr(sample_zarr_path, storage=storage)
+                    saved_datasets.append(ds_gt_loaded)
+                else:
+                    # Save to zarr
+                    if chunk_sizes is None:
+                        chunk_sizes = {'plot_id': 1, 'time': 20, 'x': 128, 'y': 128}
+                    
+                    save_dataset_efficient_zarr(
+                        ds_gt,
+                        sample_zarr_path,
+                        chunk_sizes=chunk_sizes,
+                        compression='lz4',
+                        compression_level=1,
+                        overwrite=overwrite_zarr,
+                        storage=storage
+                    )
+                    
+                    # Reload to ensure consistency
+                    ds_gt_loaded = load_dataset_zarr(sample_zarr_path, storage=storage)
+                    saved_datasets.append(ds_gt_loaded)
+            
+            self.logger.info(f"✅ Saved {len(saved_datasets)} datasets to zarr")
+            return saved_datasets
+        else:
+            self.logger.info("Skipping zarr save - returning datasets directly")
+            return ds_gt_list
     
     def _apply_temporal_smoothing(self,
                                   ds: 'xr.Dataset',
