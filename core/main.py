@@ -6,8 +6,11 @@ import os
 import sys
 import logging
 from pathlib import Path
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, TYPE_CHECKING
 from datetime import datetime
+
+if TYPE_CHECKING:
+    import xarray as xr
 
 try:
     from ..config import ConfigManager
@@ -753,6 +756,314 @@ class ForestryCarbonARR:
         except Exception as e:
             self.logger.error(f"Workflow failed: {e}", exc_info=True)
             raise ForestryCarbonError(f"Forestry ARR Eligibility analysis failed: {e}")
+    
+    def get_ds_resampled_gee(self,
+                             config: Optional[Dict[str, Any]] = None,
+                             zarr_path: Optional[str] = None,
+                             use_existing_asset: bool = False,
+                             asset_folder: Optional[str] = None,
+                             years_back: int = 10,
+                             pixel_scale: Optional[int] = None,
+                             chunk_sizes: Optional[Dict[str, int]] = None,
+                             compression: str = 'lz4',
+                             compression_level: int = 1,
+                             overwrite_zarr: bool = False,
+                             storage: str = 'auto',
+                             **kwargs) -> 'xr.Dataset':
+        """
+        Process GEE ImageCollection to get resampled xarray Dataset (ds_resampled).
+        
+        This method implements the complete workflow for processing GEE data into xarray
+        format ready for time series analysis (tsfresh). It:
+        1. Creates/prepares GEE ImageCollection with UTM reprojection
+        2. Filters by cloud cover
+        3. Creates monthly composites
+        4. Adds spectral indices (NDVI, EVI) and applies smoothing
+        5. Converts to xarray Dataset using xee engine
+        6. Saves/loads from zarr for efficient storage
+        7. Returns ds_resampled ready for tsfresh processing
+        
+        Args:
+            config: Configuration dictionary. If None, uses self.config.
+                Required keys:
+                - AOI_path: Path to AOI shapefile
+                - I_satellite: Satellite type ('Sentinel', 'Landsat', 'Planet')
+                - date_start_end: [start_date, end_date]
+                - cloud_cover_threshold: Cloud cover threshold
+                - region: Region name
+                - crs_input: Input CRS (e.g., 'EPSG:4326')
+            zarr_path: Path to zarr store (local or GCS URI like gs://bucket/path.zarr).
+                If None, uses GCS_ZARR_DIR env var + '/ds_resampled.zarr'
+            use_existing_asset: If True, use existing GEE asset instead of creating new collection.
+                Default False.
+            asset_folder: GEE asset folder path (e.g., 'projects/xxx/assets/yyy').
+                Required if use_existing_asset=True.
+            years_back: Number of years to look back from end_date for historical data.
+                Default 10.
+            pixel_scale: Pixel scale in meters. If None, auto-detects based on satellite type.
+                Sentinel-2: 10m, Landsat: 30m
+            chunk_sizes: Chunk sizes for zarr storage. Default: {'time': 40, 'x': 1024, 'y': 1024}
+            compression: Compression algorithm ('lz4', 'blosc', 'zstd', or None). Default 'lz4'.
+            compression_level: Compression level (1-9). Default 1 (fastest).
+            overwrite_zarr: Whether to overwrite existing zarr store. Default False.
+            storage: Storage type ('auto', 'local', 'gcs'). Default 'auto'.
+            **kwargs: Additional keyword arguments passed to xr.open_dataset.
+            
+        Returns:
+            xarray.Dataset: The converted dataset ready for further processing
+            
+        Raises:
+            ForestryCarbonError: If GEE_notebook_Forestry is not available or processing fails
+            ImportError: If required libraries (xarray, xee, gcsfs) are not available
+        """
+        try:
+            import xarray as xr
+        except ImportError:
+            raise ImportError("xarray is required. Install with: pip install xarray")
+        
+        try:
+            import xee
+        except ImportError:
+            raise ImportError("xee is required. Install with: pip install xee")
+        
+        if not self._gee_forestry_available:
+            raise ForestryCarbonError(
+                "GEE_notebook_Forestry not available. Please ensure it is properly set up."
+            )
+        
+        # Use provided config or self.config
+        if config is None:
+            config = self.config
+        
+        if not isinstance(config, dict):
+            raise ForestryCarbonError("config must be a dictionary")
+        
+        # Import required modules
+        import ee
+        import geemap
+        import geopandas as gpd
+        import os
+        from ..utils.zarr_utils import save_dataset_efficient_zarr, load_dataset_zarr
+        from ..utils.gee_processing import (
+            prepare_image_collection_for_processing,
+            filter_by_cloud_cover,
+            create_monthly_composites,
+            rename_composite_bands,
+            process_collection_with_indices_and_smoothing
+        )
+        from .utils import DataUtils
+        
+        self.logger.info("Starting GEE to xarray conversion workflow (get_ds_resampled_gee)...")
+        
+        # Step 1: Load AOI
+        self.logger.info("Loading AOI...")
+        data_utils = DataUtils(config, use_gee=True)
+        aoi_gpd, aoi_ee = data_utils.load_geodataframe_gee(config['AOI_path'])
+        
+        # Step 2: Create ImageCollection and prepare (UTM + reproject)
+        self.logger.info("Creating ImageCollection and preparing for processing...")
+        raw_collection, utm_crs, pixel_scale_auto, utm_epsg = prepare_image_collection_for_processing(
+            config=config,
+            aoi_gpd=aoi_gpd,
+            aoi_ee=aoi_ee,
+            years_back=years_back,
+            use_existing_asset=use_existing_asset,
+            asset_folder=asset_folder,
+            import_strategy=self.import_strategy,
+            reproject_to_utm_flag=True
+        )
+        
+        # Use provided pixel_scale or auto-detected
+        if pixel_scale is None:
+            pixel_scale = pixel_scale_auto
+        
+        config['utm_crs'] = utm_crs
+        self.logger.info(f"UTM CRS: {utm_crs}, Pixel scale: {pixel_scale}m")
+        
+        # Step 3: Filter by cloud cover
+        self.logger.info("Filtering by cloud cover...")
+        aoi_gpd_utm = aoi_gpd.to_crs(utm_crs)
+        aoi_ee_utm_geom = geemap.geopandas_to_ee(aoi_gpd_utm).geometry()
+        aoi_bounds_utm = aoi_ee_utm_geom.bounds(maxError=1)
+        
+        valid_pixel_threshold = config.get('valid_pixel_threshold', 70.0)
+        collection_filtered, stats = filter_by_cloud_cover(
+            raw_collection,
+            aoi_bounds_utm,
+            scale=pixel_scale,
+            crs=utm_crs,
+            valid_pixel_threshold=valid_pixel_threshold
+        )
+        
+        # Step 4: Create monthly composites and rename bands
+        self.logger.info("Creating monthly composites...")
+        monthly_images = create_monthly_composites(
+            collection_filtered,
+            aoi_ee.geometry(),
+            reducer='median'
+        )
+        
+        collection_monthly_raw = ee.ImageCollection(monthly_images).sort('system:time_start')
+        collection_monthly = rename_composite_bands(
+            collection_monthly_raw,
+            remove_suffix='_median',
+            exclude_bands=['cloudM']
+        )
+        
+        # Step 5: Add spectral indices and apply smoothing
+        self.logger.info("Adding spectral indices and applying smoothing...")
+        collection_with_sg = process_collection_with_indices_and_smoothing(
+            collection=collection_monthly,
+            config=config,
+            aoi_ee=aoi_ee,
+            spectral_bands=['NDVI', 'EVI'],
+            smoothing_window=3,
+            smoothing_polyorder=2,
+            add_fcd=False
+        )
+        
+        # Step 6: Convert to xarray using xee
+        self.logger.info("Converting GEE ImageCollection to xarray using xee...")
+        aoi_ee_utm_geom = geemap.geopandas_to_ee(aoi_gpd_utm).geometry()
+        ds = xr.open_dataset(
+            collection_with_sg,
+            engine='ee',
+            crs=utm_crs,
+            scale=pixel_scale,
+            geometry=aoi_ee_utm_geom,
+            **kwargs
+        )
+        
+        self.logger.info(f"Dataset created: {dict(ds.dims)}")
+        
+        # Step 7: Determine zarr path
+        if zarr_path is None:
+            zarr_path = os.getenv('GCS_ZARR_DIR', '')
+            if not zarr_path:
+                # Fallback to local path
+                zarr_path = os.path.join(os.getcwd(), 'data', 'ds_resampled.zarr')
+            else:
+                zarr_path = os.path.join(zarr_path, 'ds_resampled.zarr')
+        
+        # Step 8: Save or load from zarr
+        if storage == 'auto':
+            storage = 'gcs' if zarr_path.startswith('gs://') else 'local'
+        
+        # Check if zarr exists
+        zarr_exists = False
+        if storage == 'gcs':
+            try:
+                import gcsfs
+                fs = gcsfs.GCSFileSystem(project=os.getenv('GOOGLE_CLOUD_PROJECT'))
+                zarr_exists = fs.exists(zarr_path)
+            except Exception:
+                zarr_exists = False
+        else:
+            zarr_exists = os.path.exists(zarr_path)
+        
+        if zarr_exists and not overwrite_zarr:
+            self.logger.info(f"Loading existing zarr dataset from: {zarr_path}")
+            ds_raw = load_dataset_zarr(zarr_path, storage=storage)
+        else:
+            self.logger.info("Preparing dataset for zarr storage...")
+            ds_raw = ds
+            
+            # Save to zarr
+            if chunk_sizes is None:
+                chunk_sizes = {'time': 40, 'x': 1024, 'y': 1024}
+            
+            self.logger.info(f"Saving dataset to zarr: {zarr_path}")
+            save_dataset_efficient_zarr(
+                ds_raw,
+                zarr_path,
+                chunk_sizes=chunk_sizes,
+                compression=compression,
+                compression_level=compression_level,
+                overwrite=overwrite_zarr,
+                storage=storage
+            )
+            
+            # Reload to ensure consistency
+            ds_raw = load_dataset_zarr(zarr_path, storage=storage)
+        
+        self.logger.info("GEE to xarray conversion workflow completed successfully!")
+        return ds_raw
+    
+    def _apply_temporal_smoothing(self,
+                                  ds: 'xr.Dataset',
+                                  window_length: int = 3,
+                                  polyorder: int = 2,
+                                  resample_freq: Optional[str] = None) -> 'xr.Dataset':
+        """
+        Apply Savitzky-Golay temporal smoothing to xarray dataset.
+        
+        Args:
+            ds: Input xarray Dataset
+            window_length: Window length for smoothing (must be odd)
+            polyorder: Polynomial order for smoothing
+            resample_freq: Optional resampling frequency (e.g., 'MS' for monthly)
+            
+        Returns:
+            Smoothed xarray Dataset
+        """
+        try:
+            from scipy.signal import savgol_filter
+        except ImportError:
+            raise ImportError("scipy is required for smoothing. Install with: pip install scipy")
+        
+        import pandas as pd
+        import numpy as np
+        import xarray as xr
+        
+        # Ensure window_length is odd
+        if window_length % 2 == 0:
+            window_length += 1
+        if window_length < polyorder + 1:
+            window_length = polyorder + 1
+            if window_length % 2 == 0:
+                window_length += 1
+        
+        self.logger.info(f"Applying Savitzky-Golay smoothing (window={window_length}, polyorder={polyorder})...")
+        
+        # Apply smoothing to each data variable
+        smoothed_data = {}
+        for var_name in ds.data_vars:
+            var_data = ds[var_name]
+            
+            # Chunk for efficient processing
+            var_chunked = var_data.chunk({"time": -1, "y": 256, "x": 256})
+            
+            # Apply smoothing function
+            def smooth_1d(ts):
+                if np.all(np.isnan(ts)):
+                    return ts
+                try:
+                    return savgol_filter(ts, window_length=window_length, polyorder=polyorder, mode="interp")
+                except Exception:
+                    return ts
+            
+            smoothed_var = xr.apply_ufunc(
+                smooth_1d,
+                var_chunked,
+                input_core_dims=[["time"]],
+                output_core_dims=[["time"]],
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[var_data.dtype],
+            )
+            
+            smoothed_data[var_name] = smoothed_var
+        
+        # Create smoothed dataset
+        ds_smoothed = xr.Dataset(smoothed_data, coords=ds.coords, attrs=ds.attrs)
+        
+        # Apply resampling if requested
+        if resample_freq:
+            self.logger.info(f"Resampling to {resample_freq}...")
+            ds_smoothed = ds_smoothed.resample(time=resample_freq).mean()
+            ds_smoothed = ds_smoothed.compute()
+        
+        return ds_smoothed
     
     def __repr__(self) -> str:
         return f"ForestryCarbonARR(gee_forestry_available={self._gee_forestry_available}, strategy={self._import_strategy})"
