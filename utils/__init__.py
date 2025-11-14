@@ -5,7 +5,14 @@ Utility modules for Forestry Carbon ARR library.
 from .dependency_manager import DependencyManager
 from .path_resolver import PathResolver
 from .config_loader import ConfigLoader
-from .zarr_utils import save_dataset_efficient_zarr, load_dataset_zarr
+from .zarr_utils import (
+    save_dataset_efficient_zarr, 
+    load_dataset_zarr,
+    check_zarr_gee_compatibility,
+    get_gee_zarr_uri,
+    list_zarr_variables,
+    convert_zarr_for_gee
+)
 from .spectral_indices import (
     SpectralIndicesUtils,
     get_index_info,
@@ -56,6 +63,10 @@ __all__ = [
     'ConfigLoader',
     'save_dataset_efficient_zarr',
     'load_dataset_zarr',
+    'check_zarr_gee_compatibility',
+    'get_gee_zarr_uri',
+    'list_zarr_variables',
+    'convert_zarr_for_gee',
     'SpectralIndicesUtils',
     'get_index_info',
     'formula',

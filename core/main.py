@@ -1546,7 +1546,8 @@ class ForestryCarbonARR:
         overwrite_zarr: bool = False,
         save_to_zarr: bool = True,
         storage: str = 'auto',
-        show_progress: bool = True
+        show_progress: bool = True,
+        gee_compatible: bool = True
     ) -> 'xr.Dataset':
         """
         Download and process satellite data from Microsoft Planetary Computer (MPC) using STAC.
@@ -1567,12 +1568,14 @@ class ForestryCarbonARR:
             pixel_scale: Pixel scale in meters for reprojection. If None, uses default from config (10m for Sentinel-2, 30m for Landsat).
             zarr_path: Output zarr path. If None, auto-generates from config.
             chunk_sizes: Chunk sizes for zarr storage. Default: {'time': 10, 'x': 512, 'y': 512}.
-            compression: Compression algorithm ('lz4', 'blosc', 'zstd', or None). Default 'lz4'.
+            compression: Compression algorithm ('lz4', 'blosc', 'zstd', 'gzip', 'zlib', or None). Default 'lz4'.
             compression_level: Compression level (1-9). Default 1.
             overwrite_zarr: Whether to overwrite existing zarr store. Default False.
             save_to_zarr: Whether to save to zarr. Default True.
             storage: Storage type ('auto', 'local', 'gcs'). Default 'auto'.
             show_progress: Whether to show progress bars. Default True.
+            gee_compatible: Whether to save in GEE-compatible format (Zarr v2, consolidated metadata).
+                Default True. When True, ensures compatibility with ee.ImageCollection.loadZarrV2Array.
         
         Returns:
             xr.Dataset: Processed satellite data in UTM projection
@@ -1743,7 +1746,8 @@ class ForestryCarbonARR:
                 compression=compression,
                 compression_level=compression_level,
                 overwrite=overwrite_zarr,
-                storage=storage
+                storage=storage,
+                gee_compatible=gee_compatible  # Default True - ensures GEE compatibility
             )
             
             self.logger.info("✅ Dataset saved to zarr")
@@ -1757,6 +1761,166 @@ class ForestryCarbonARR:
         print("=" * 60)
         
         return ds_stac
+    
+    def check_zarr_gee_compatibility(
+        self,
+        zarr_path: str,
+        data_var: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Check if a zarr store is compatible with Google Earth Engine.
+        
+        GEE requires zarr URIs to end with '/.zarray' for individual arrays.
+        This method checks the zarr structure and provides compatibility information.
+        
+        Args:
+            zarr_path: Path to zarr store (local or GCS URI like gs://bucket/path.zarr)
+            data_var: Optional data variable name to check specific array
+        
+        Returns:
+            Dictionary with compatibility information:
+                - 'is_gee_compatible': bool - Whether the path format is GEE-compatible
+                - 'zarr_path': str - Original zarr path
+                - 'gee_uri': str - GEE-compatible URI (if applicable)
+                - 'is_gcs': bool - Whether path is a GCS URI
+                - 'has_zarray': bool - Whether .zarray file exists
+                - 'recommendations': List[str] - Recommendations for GEE compatibility
+                - 'available_variables': List[str] - Available data variables (if zarr can be loaded)
+        
+        Example:
+            >>> forestry = ForestryCarbonARR(config_path='config.json')
+            >>> result = forestry.check_zarr_gee_compatibility('gs://bucket/data.zarr', 'NDVI')
+            >>> print(result['gee_uri'])
+            'gs://bucket/data.zarr/NDVI/.zarray'
+        """
+        from ..utils.zarr_utils import (
+            check_zarr_gee_compatibility,
+            get_gee_zarr_uri,
+            list_zarr_variables
+        )
+        
+        # Check compatibility
+        result = check_zarr_gee_compatibility(zarr_path, data_var=data_var)
+        
+        # Try to list available variables
+        try:
+            variables = list_zarr_variables(zarr_path, storage='auto')
+            result['available_variables'] = variables
+            if variables and not data_var:
+                result['recommendations'].append(
+                    f"Available variables: {', '.join(variables)}. "
+                    f"Specify a variable name to get the correct GEE URI."
+                )
+        except Exception as e:
+            result['available_variables'] = []
+            result['recommendations'].append(f"Could not load zarr to list variables: {e}")
+        
+        return result
+    
+    def get_gee_zarr_uri(
+        self,
+        zarr_path: str,
+        data_var: Optional[str] = None
+    ) -> str:
+        """
+        Convert zarr store path to GEE-compatible URI.
+        
+        GEE requires zarr URIs to end with '/.zarray' for individual arrays.
+        
+        Args:
+            zarr_path: Path to zarr store (local or GCS URI like gs://bucket/path.zarr)
+            data_var: Optional data variable name. If provided, returns URI for that specific array.
+                      If None and dataset has multiple variables, you need to specify the variable.
+        
+        Returns:
+            GEE-compatible URI ending with '/.zarray'
+        
+        Example:
+            >>> forestry = ForestryCarbonARR(config_path='config.json')
+            >>> uri = forestry.get_gee_zarr_uri('gs://bucket/data.zarr', 'NDVI')
+            >>> print(uri)
+            'gs://bucket/data.zarr/NDVI/.zarray'
+        """
+        from ..utils.zarr_utils import get_gee_zarr_uri
+        return get_gee_zarr_uri(zarr_path, data_var=data_var)
+    
+    def list_zarr_variables(
+        self,
+        zarr_path: str,
+        storage: str = 'auto'
+    ) -> list:
+        """
+        List all data variables in a zarr store.
+        
+        Useful for determining which variables are available for GEE export.
+        
+        Args:
+            zarr_path: Path to zarr store (local or GCS URI)
+            storage: Storage type ('auto', 'local', 'gcs'). Default 'auto'.
+        
+        Returns:
+            List of data variable names
+        
+        Example:
+            >>> forestry = ForestryCarbonARR(config_path='config.json')
+            >>> vars = forestry.list_zarr_variables('gs://bucket/data.zarr')
+            >>> print(vars)
+            ['NDVI', 'EVI', 'blue', 'green']
+        """
+        from ..utils.zarr_utils import list_zarr_variables
+        return list_zarr_variables(zarr_path, storage=storage)
+    
+    def convert_zarr_for_gee(
+        self,
+        zarr_path: str,
+        output_path: Optional[str] = None,
+        data_var: Optional[str] = None,
+        storage: str = 'auto',
+        overwrite: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Convert zarr dataset to GEE-compatible format.
+        
+        This function ensures the zarr meets all GEE requirements:
+        - Adds _ARRAY_DIMENSIONS metadata
+        - Uses GEE-compatible compression (lz4)
+        - Creates consolidated metadata (.zmetadata)
+        - Ensures CRS information is present
+        - Validates spatial dimensions (Y, X as last two)
+        
+        Args:
+            zarr_path: Path to input zarr store
+            output_path: Path to output GEE-compatible zarr. If None, overwrites input.
+            data_var: Optional data variable name to export. If None, exports all variables.
+            storage: Storage type ('auto', 'local', 'gcs'). Default 'auto'.
+            overwrite: Whether to overwrite existing output. Default False.
+        
+        Returns:
+            Dictionary with conversion results:
+                - 'success': bool - Whether conversion was successful
+                - 'output_path': str - Path to converted zarr
+                - 'gee_uri': str - GEE-compatible URI
+                - 'warnings': List[str] - Any warnings during conversion
+                - 'requirements_met': Dict[str, bool] - Which GEE requirements are met
+        
+        Example:
+            >>> forestry = ForestryCarbonARR(config_path='config.json')
+            >>> result = forestry.convert_zarr_for_gee(
+            ...     'gs://bucket/data.zarr',
+            ...     output_path='gs://bucket/data_gee.zarr',
+            ...     data_var='NDVI'
+            ... )
+            >>> print(result['gee_uri'])
+            'gs://bucket/data_gee.zarr/NDVI/.zarray'
+        """
+        from ..utils.zarr_utils import convert_zarr_for_gee
+        return convert_zarr_for_gee(
+            zarr_path=zarr_path,
+            output_path=output_path,
+            data_var=data_var,
+            storage=storage,
+            overwrite=overwrite
+        )
     
     def __repr__(self) -> str:
         return f"ForestryCarbonARR(gee_forestry_available={self._gee_forestry_available}, strategy={self._import_strategy})"
