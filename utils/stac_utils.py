@@ -616,40 +616,36 @@ def calculate_mpc_date_range(
     days_offset: int = 15
 ) -> Tuple[str, str]:
     """
-    Calculate MPC date range based on ds_resampled minimum date.
+    Calculate MPC date range based on ds_resampled dates.
     
-    This follows the notebook workflow:
-    1. Get min_date as numpy datetime64 directly
-    2. Calculate end_date by subtracting days_offset from min_date (using pandas for date arithmetic)
-    3. Calculate start_date as years_back years before the end year
+    Simple calculation:
+    - Start date: max_date - years_back years
+    - End date: min_date - days_offset days
     
     Args:
         ds_resampled: xarray Dataset with time coordinate
-        years_back: Number of years to go back from the end year. Default 11.
+        years_back: Number of years to go back from max_date for start date. Default 11.
         days_offset: Days to subtract from min_date for end date. Default 15.
         
     Returns:
         Tuple of (start_date, end_date) as strings in 'YYYY-MM-DD' format
     """
-    import xarray as xr
+    import pandas as pd
+    import numpy as np
     
-    # Get minimum date from dataset as numpy datetime64 (matches notebook)
-    min_date = ds_resampled.time.values.min()
+    # Get max and min dates from dataset
+    max_date = ds_resampled.time.max().values
+    min_date = ds_resampled.time.min().values
     
-    # Calculate end date (min_date - days_offset) using pandas for date arithmetic
-    # This matches the notebook: mpc_end_date = pd.Timestamp(min_date) - pd.DateOffset(days=15)
-    mpc_end_date = pd.Timestamp(min_date) - pd.DateOffset(days=days_offset)
-    # Convert pandas Timestamp to numpy datetime64 for string conversion
-    # The notebook uses: mpc_end_date_str = np.datetime_as_string(mpc_end_date.to_numpy(), unit='D')
-    # Convert to numpy datetime64 - ensure it's a proper numpy datetime64 scalar
-    mpc_end_date_np = np.datetime64(mpc_end_date, 'D')  # 'D' for day precision
-    mpc_end_date_str = np.datetime_as_string(mpc_end_date_np, unit='D')
+    # Calculate start date: max_date - years_back years
+    start_date_pd = pd.Timestamp(max_date) - pd.DateOffset(years=years_back)
+    start_date_np = np.datetime64(start_date_pd, 'D')
+    start_date = np.datetime_as_string(start_date_np, unit='D')
     
-    # Calculate start date (years_back years before the end year)
-    # Get the year from the end date string
-    end_year = int(mpc_end_date_str.split('-')[0])
-    start_year = end_year - years_back
-    start_date = f"{start_year}-01-01"
+    # Calculate end date: min_date - days_offset days
+    end_date_pd = pd.Timestamp(min_date) - pd.DateOffset(days=days_offset)
+    end_date_np = np.datetime64(end_date_pd, 'D')
+    end_date = np.datetime_as_string(end_date_np, unit='D')
     
-    return start_date, mpc_end_date_str
+    return start_date, end_date
 
