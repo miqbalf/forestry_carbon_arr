@@ -16,7 +16,7 @@ import planetary_computer
 import dask.diagnostics
 from shapely.geometry import box
 from shapely import to_geojson
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union, List
 import logging
 import rasterio
 from rasterio.errors import RasterioIOError
@@ -33,15 +33,21 @@ class STACProcessor:
     Handles STAC-based satellite data acquisition and processing.
     """
     
-    def __init__(self, config_manager):
+    def __init__(self, config_manager, datetime_override: Optional[Union[str, List[str]]] = None,
+                 resolution_override: Optional[int] = None):
         """
         Initialize the STAC processor.
         
         Args:
             config_manager: Configuration manager instance
+            datetime_override: Optional datetime override for STAC search (can override config)
+            resolution_override: Optional resolution override in meters (can override config)
         """
         self.config = config_manager
-        self.satellite_config = config_manager.get_stac_config()
+        self.satellite_config = config_manager.get_stac_config(
+            datetime_override=datetime_override,
+            resolution_override=resolution_override
+        )
     
     def search_satellite_data(self, bbox: box, datetime_range: Optional[str] = None) -> list:
         """
@@ -149,7 +155,9 @@ class STACProcessor:
         )
         
         # Reproject AOI to satellite CRS
-        aoi_gdf = gpd.GeoDataFrame(geometry=[bbox], crs=self.config.get('aoi_crs_treeo_cloud'))
+        # Bbox comes from WGS84 (EPSG:4326) - set CRS explicitly
+        # The bbox from get_ds_sampled_mpc is always in WGS84 (EPSG:4326)
+        aoi_gdf = gpd.GeoDataFrame(geometry=[bbox], crs='EPSG:4326')
         aoi_reprojected = aoi_gdf.to_crs(crs_string)
         xmin, ymin, xmax, ymax = aoi_reprojected.total_bounds
         
@@ -214,7 +222,7 @@ class STACProcessor:
                   (scl == 8) + (scl == 9) + (scl == 10) + np.isnan(scl)
         
         # Add validity mask
-        data['is_valid'] = ~(is_cloud.astype(np.bool))
+        data['is_valid'] = ~(is_cloud.astype(bool))
         
         return data
     
@@ -329,7 +337,9 @@ class STACProcessor:
         
         # Calculate AOI area for time estimation
         aoi_gdf = gpd.GeoDataFrame(geometry=[bbox], crs='EPSG:4326')
-        aoi_utm = aoi_gdf.to_crs('EPSG:32636')
+        # Use output_crs from config if available, otherwise use a default UTM (EPSG:32636)
+        output_crs = self.config.get('output_crs') or 'EPSG:32636'
+        aoi_utm = aoi_gdf.to_crs(output_crs)
         area_ha = aoi_utm.geometry.area.sum() / 10000
         
         print(f"📊 AOI Area: {area_ha:.1f} hectares")

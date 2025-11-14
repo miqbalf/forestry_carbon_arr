@@ -1636,8 +1636,13 @@ class ForestryCarbonARR:
                 self.logger.info(f"Zarr not found or error loading: {e}. Proceeding with download...")
                 print(f"📥 Zarr not found. Proceeding with download...")
         
-        # Step 3: Initialize STAC processor
-        stac_processor = STACProcessor(self.config)
+        # Step 3: Initialize STAC processor with datetime override from date_range_mpc
+        # Pass date_range_mpc as datetime_override to override config date_start_end
+        stac_processor = STACProcessor(
+            self.config_manager,  # Pass ConfigManager instance, not dict
+            datetime_override=date_range_mpc,  # Use dynamic date_range_mpc instead of config
+            resolution_override=None  # Use resolution_satellite from config
+        )
         
         # Step 4: Process satellite data (download, cloud masking, band renaming)
         self.logger.info("Processing satellite data from STAC...")
@@ -1654,13 +1659,21 @@ class ForestryCarbonARR:
         
         # Step 5: Reproject to UTM if needed
         if utm_crs is None:
-            # Calculate UTM CRS from bbox
-            aoi_gdf = gpd.GeoDataFrame(geometry=[bbox], crs='EPSG:4326')
-            utm_crs, utm_epsg, hemisphere = calculate_utm_crs(aoi_gdf)
-            self.logger.info(f"Auto-calculated UTM CRS: {utm_crs}")
-            print(f"🗺️  Auto-calculated UTM CRS: {utm_crs}")
+            # First try to use output_crs from config
+            output_crs = self.config.get('output_crs')
+            if output_crs:
+                utm_crs = output_crs
+                utm_epsg = int(utm_crs.split(':')[-1]) if ':' in utm_crs else int(utm_crs)
+                self.logger.info(f"Using output_crs from config: {utm_crs}")
+                print(f"🗺️  Using output_crs from config: {utm_crs}")
+            else:
+                # Calculate UTM CRS from bbox as fallback
+                aoi_gdf = gpd.GeoDataFrame(geometry=[bbox], crs='EPSG:4326')
+                utm_crs, utm_epsg, hemisphere = calculate_utm_crs(aoi_gdf)
+                self.logger.info(f"Auto-calculated UTM CRS: {utm_crs}")
+                print(f"🗺️  Auto-calculated UTM CRS: {utm_crs}")
         else:
-            utm_epsg = int(utm_crs.split(':')[1]) if ':' in utm_crs else int(utm_crs)
+            utm_epsg = int(utm_crs.split(':')[-1]) if ':' in utm_crs else int(utm_crs)
         
         if pixel_scale is None:
             pixel_scale = get_pixel_scale(self.config.get('I_satellite', 'Sentinel'))

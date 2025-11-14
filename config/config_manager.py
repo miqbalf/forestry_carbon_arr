@@ -5,7 +5,7 @@ Configuration manager for Forestry Carbon ARR library.
 import json
 import yaml
 from pathlib import Path
-from typing import Dict, Any, Union, Optional
+from typing import Dict, Any, Union, Optional, List
 import logging
 
 from .default_config import DEFAULT_CONFIG
@@ -180,44 +180,12 @@ class ConfigManager:
         """
         Get the current configuration.
         
-        Returns a clean configuration without duplicate flat keys
-        that have been normalized to nested structure.
+        Returns the configuration dictionary. For backward compatibility,
+        flat keys are preserved even if nested equivalents exist, as some
+        external libraries may depend on the flat structure.
         """
-        config_copy = self._config.copy()
-        
-        # Remove flat keys that have been normalized to nested structure
-        # to avoid confusion and duplicates
-        flat_keys_to_remove = [
-            'date_start_end',  # → satellite.date_range
-            'cloud_cover_threshold',  # → satellite.cloud_cover_threshold (if in satellite section)
-            'I_satellite',  # → satellite.provider
-            'region',  # → project.region (if in project section)
-            'high_forest',  # → fcd.thresholds.high_forest
-            'yrf_forest',  # → fcd.thresholds.yrf_forest
-            'shrub_grass',  # → fcd.thresholds.shrub_grass
-            'open_land',  # → fcd.thresholds.open_land
-        ]
-        
-        # Only remove if they exist in nested structure
-        for key in flat_keys_to_remove:
-            if key in config_copy:
-                # Check if normalized version exists
-                mappings = {
-                    'date_start_end': 'satellite.date_range',
-                    'cloud_cover_threshold': 'satellite.cloud_cover_threshold',
-                    'I_satellite': 'satellite.provider',
-                    'region': 'project.region',
-                    'high_forest': 'fcd.thresholds.high_forest',
-                    'yrf_forest': 'fcd.thresholds.yrf_forest',
-                    'shrub_grass': 'fcd.thresholds.shrub_grass',
-                    'open_land': 'fcd.thresholds.open_land',
-                }
-                nested_path = mappings.get(key)
-                if nested_path and self.get(nested_path) is not None:
-                    # Remove flat key if nested version exists
-                    del config_copy[key]
-        
-        return config_copy
+        # Return a copy to prevent accidental modification
+        return self._config.copy()
     
     def get(self, key: str, default: Any = None) -> Any:
         """
@@ -274,6 +242,131 @@ class ConfigManager:
         
         # Try as flat key
         return self._config.get(key, default)
+    
+    def get_stac_config(self, datetime_override: Optional[Union[str, List[str]]] = None, 
+                       resolution_override: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Get STAC satellite configuration by mapping from forestry.config.
+        
+        Maps existing config keys to STAC config format:
+        - collection_mpc → collection_satellite_cloud
+        - cloud_cover_threshold → cloud_cover_satellite
+        - resolution_satellite → resolution_satellite (spatial resolution in meters)
+        - output_crs → satellite_crs
+        - assets_satellite → assets_satellite
+        - band_mapping → band_mapping
+        
+        Args:
+            datetime_override: Optional datetime override (can be string "YYYY-MM-DD/YYYY-MM-DD" 
+                              or list ["YYYY-MM-DD", "YYYY-MM-DD"]). If None, uses date_start_end from config.
+            resolution_override: Optional resolution override in meters. If None, uses resolution_satellite from config.
+        
+        Prints missing config keys that need to be added.
+        
+        Returns:
+            Dict[str, Any]: STAC satellite configuration
+        """
+        stac_config = {}
+        missing_keys = []
+        
+        # 1. url_satellite_cloud
+        url = self.get('url_satellite_cloud')
+        if url:
+            stac_config['url'] = url
+        else:
+            missing_keys.append('url_satellite_cloud')
+            stac_config['url'] = None
+        
+        # 2. collection_satellite_cloud → collection_mpc
+        collection = self.get('collection_mpc')
+        if collection:
+            stac_config['collection'] = collection
+        else:
+            missing_keys.append('collection_mpc')
+            stac_config['collection'] = None
+        
+        # 3. datetime_satellite → use override or date_start_end from config
+        if datetime_override is not None:
+            # Use override (from date_range_mpc in notebook)
+            if isinstance(datetime_override, list) and len(datetime_override) == 2:
+                start_date = str(datetime_override[0]).strip()
+                end_date = str(datetime_override[1]).strip()
+                stac_config['datetime'] = f"{start_date}/{end_date}"
+            else:
+                stac_config['datetime'] = str(datetime_override)
+        else:
+            # Fall back to config
+            date_range = self.get('date_start_end')
+            if date_range:
+                if isinstance(date_range, list) and len(date_range) == 2:
+                    start_date = str(date_range[0]).strip()
+                    end_date = str(date_range[1]).strip()
+                    stac_config['datetime'] = f"{start_date}/{end_date}"
+                else:
+                    stac_config['datetime'] = str(date_range)
+            else:
+                missing_keys.append('date_start_end (or pass datetime_override)')
+                stac_config['datetime'] = None
+        
+        # 4. cloud_cover_satellite → cloud_cover_threshold
+        cloud_cover = self.get('cloud_cover_threshold')
+        if cloud_cover is not None:
+            stac_config['cloud_cover'] = cloud_cover
+        else:
+            missing_keys.append('cloud_cover_threshold')
+            stac_config['cloud_cover'] = None
+        
+        # 5. resolution_satellite → use override or resolution_satellite from config
+        if resolution_override is not None:
+            stac_config['resolution'] = resolution_override
+        else:
+            resolution = self.get('resolution_satellite')
+            if resolution is not None:
+                stac_config['resolution'] = resolution
+            else:
+                missing_keys.append('resolution_satellite (or pass resolution_override)')
+                stac_config['resolution'] = None
+        
+        # 6. assets_satellite → from config (assets_satellite key)
+        assets = self.get('assets_satellite')
+        if assets:
+            stac_config['assets'] = assets
+        else:
+            missing_keys.append('assets_satellite')
+            stac_config['assets'] = None
+        
+        # 7. band_mapping → from config (band_mapping key)
+        band_mapping = self.get('band_mapping', {})
+        if band_mapping:
+            stac_config['band_mapping'] = band_mapping
+        else:
+            missing_keys.append('band_mapping')
+            stac_config['band_mapping'] = {}
+        
+        # 8. satellite_crs → from config (output_crs key)
+        crs = self.get('output_crs')
+        if crs:
+            stac_config['crs'] = crs
+        else:
+            missing_keys.append('output_crs')
+            stac_config['crs'] = None
+        
+        # Print missing keys
+        if missing_keys:
+            self.logger.warning("=" * 60)
+            self.logger.warning("⚠️  MISSING STAC CONFIG KEYS")
+            self.logger.warning("=" * 60)
+            print("=" * 60)
+            print("⚠️  MISSING STAC CONFIG KEYS")
+            print("=" * 60)
+            for key in missing_keys:
+                self.logger.warning(f"  ❌ {key}")
+                print(f"  ❌ {key}")
+            print("=" * 60)
+            print("💡 Add these keys to your config file for full STAC functionality")
+            print("=" * 60)
+        
+        return stac_config
     
     def set(self, key: str, value: Any) -> None:
         """

@@ -8,6 +8,7 @@ to/from zarr stores, supporting both local filesystem and Google Cloud Storage.
 import os
 import time
 import shutil
+import json
 import xarray as xr
 from numcodecs import Blosc
 from typing import Optional, Dict, Any
@@ -39,6 +40,93 @@ def _format_size(size_bytes: float) -> str:
             return f"{size_bytes:.2f} {unit}"
         size_bytes /= 1024.0
     return f"{size_bytes:.2f} PB"
+
+
+def _clean_dataset_attrs(ds: xr.Dataset) -> xr.Dataset:
+    """
+    Clean non-serializable attributes from dataset before saving to zarr.
+    
+    Removes or converts attributes that can't be serialized to JSON,
+    such as RasterSpec objects from stackstac.
+    
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        Dataset to clean
+        
+    Returns
+    -------
+    xarray.Dataset
+        Dataset with cleaned attributes
+    """
+    # Create a copy to avoid modifying the original
+    ds_clean = ds.copy(deep=False)
+    
+    # List of attribute keys that are known to be non-serializable
+    # These are typically added by stackstac
+    problematic_attrs = ['spec', 'transform', 'raster_spec']
+    
+    # Clean dataset-level attributes
+    attrs_to_remove = []
+    attrs_to_keep = {}
+    
+    for key, value in ds_clean.attrs.items():
+        # Check if it's a problematic attribute or non-serializable
+        if key in problematic_attrs:
+            attrs_to_remove.append(key)
+        else:
+            # Try to serialize to check if it's JSON-serializable
+            try:
+                json.dumps(value)
+                attrs_to_keep[key] = value
+            except (TypeError, ValueError):
+                # Not serializable, remove it
+                attrs_to_remove.append(key)
+                logger.debug(f"Removing non-serializable attribute: {key} (type: {type(value).__name__})")
+    
+    # Remove problematic attributes
+    for key in attrs_to_remove:
+        if key in ds_clean.attrs:
+            del ds_clean.attrs[key]
+    
+    # Clean variable-level attributes
+    for var_name in ds_clean.data_vars:
+        var_attrs_to_remove = []
+        for key, value in ds_clean[var_name].attrs.items():
+            if key in problematic_attrs:
+                var_attrs_to_remove.append(key)
+            else:
+                try:
+                    json.dumps(value)
+                except (TypeError, ValueError):
+                    var_attrs_to_remove.append(key)
+                    logger.debug(f"Removing non-serializable attribute from {var_name}: {key} (type: {type(value).__name__})")
+        
+        for key in var_attrs_to_remove:
+            if key in ds_clean[var_name].attrs:
+                del ds_clean[var_name].attrs[key]
+    
+    # Clean coordinate-level attributes
+    for coord_name in ds_clean.coords:
+        coord_attrs_to_remove = []
+        for key, value in ds_clean.coords[coord_name].attrs.items():
+            if key in problematic_attrs:
+                coord_attrs_to_remove.append(key)
+            else:
+                try:
+                    json.dumps(value)
+                except (TypeError, ValueError):
+                    coord_attrs_to_remove.append(key)
+                    logger.debug(f"Removing non-serializable attribute from coordinate {coord_name}: {key} (type: {type(value).__name__})")
+        
+        for key in coord_attrs_to_remove:
+            if key in ds_clean.coords[coord_name].attrs:
+                del ds_clean.coords[coord_name].attrs[key]
+    
+    if attrs_to_remove:
+        logger.info(f"Cleaned {len(attrs_to_remove)} non-serializable attributes from dataset")
+    
+    return ds_clean
 
 
 def save_dataset_efficient_zarr(
@@ -159,6 +247,10 @@ def save_dataset_efficient_zarr(
         encoding = {}
     else:
         encoding = compression  # assume dict supplied
+    
+    # Clean non-serializable attributes before saving
+    logger.info("Cleaning dataset attributes for zarr compatibility...")
+    ds = _clean_dataset_attrs(ds)
     
     # Chunk and save
     ds_chunked = ds.chunk(chunk_sizes)
