@@ -40,6 +40,15 @@ from .tsfresh_utils import (
     merge_all_masks_4d,
     prepare_tsfresh_data_with_ground_truth
 )
+from .stac_utils import (
+    parse_stac_id,
+    find_duplicate_stac_scenes,
+    create_fresh_stac_client,
+    search_and_analyze_duplicate_stac_scenes,
+    create_unified_stac_visualization,
+    debug_stac_scene_data,
+    calculate_mpc_date_range
+)
 
 __all__ = [
     'DependencyManager', 
@@ -74,5 +83,12 @@ __all__ = [
     'parallel_rasterize_with_layer',
     'merge_all_masks_4d',
     'standardize_to_stac_convention',
-    'prepare_tsfresh_data_with_ground_truth'
+    'prepare_tsfresh_data_with_ground_truth',
+    'parse_stac_id',
+    'find_duplicate_stac_scenes',
+    'create_fresh_stac_client',
+    'search_and_analyze_duplicate_stac_scenes',
+    'create_unified_stac_visualization',
+    'debug_stac_scene_data',
+    'calculate_mpc_date_range'
 ]

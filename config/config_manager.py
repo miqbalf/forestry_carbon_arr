@@ -80,6 +80,58 @@ class ConfigManager:
             self.logger.error(f"Failed to load configuration from {config_path}: {e}")
             raise
     
+    def _normalize_flat_config(self, flat_config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Normalize flat configuration keys to nested structure.
+        
+        Maps legacy flat keys (from JSON files) to nested structure:
+        - date_start_end → satellite.date_range
+        - cloud_cover_threshold → satellite.cloud_cover_threshold
+        - I_satellite → satellite.provider
+        - high_forest, yrf_forest, etc. → fcd.thresholds.*
+        - region → project.region
+        
+        Args:
+            flat_config: Flat configuration dictionary
+            
+        Returns:
+            Normalized configuration dictionary
+        """
+        normalized = {}
+        flat_keys_to_remove = []
+        
+        # Mapping of flat keys to nested paths
+        key_mappings = {
+            'date_start_end': 'satellite.date_range',
+            'cloud_cover_threshold': 'satellite.cloud_cover_threshold',
+            'I_satellite': 'satellite.provider',
+            'region': 'project.region',
+            'high_forest': 'fcd.thresholds.high_forest',
+            'yrf_forest': 'fcd.thresholds.yrf_forest',
+            'shrub_grass': 'fcd.thresholds.shrub_grass',
+            'open_land': 'fcd.thresholds.open_land',
+        }
+        
+        # Apply mappings
+        for flat_key, nested_path in key_mappings.items():
+            if flat_key in flat_config:
+                keys = nested_path.split('.')
+                # Create nested structure
+                current = normalized
+                for k in keys[:-1]:
+                    if k not in current:
+                        current[k] = {}
+                    current = current[k]
+                current[keys[-1]] = flat_config[flat_key]
+                flat_keys_to_remove.append(flat_key)
+        
+        # Copy remaining keys that don't need mapping
+        for key, value in flat_config.items():
+            if key not in flat_keys_to_remove:
+                normalized[key] = value
+        
+        return normalized
+    
     def _merge_config(self, new_config: Dict[str, Any]) -> None:
         """
         Merge new configuration with existing configuration.
@@ -87,6 +139,9 @@ class ConfigManager:
         Args:
             new_config: New configuration to merge
         """
+        # Normalize flat keys to nested structure
+        normalized_config = self._normalize_flat_config(new_config)
+        
         def deep_merge(base_dict: Dict, update_dict: Dict) -> Dict:
             """Recursively merge dictionaries."""
             for key, value in update_dict.items():
@@ -96,34 +151,129 @@ class ConfigManager:
                     base_dict[key] = value
             return base_dict
         
-        self._config = deep_merge(self._config, new_config)
+        self._config = deep_merge(self._config, normalized_config)
         self.logger.debug("Configuration merged successfully")
+    
+    def _get_with_fallback(self, key: str, nested_path: str = None) -> Any:
+        """
+        Get configuration value with backward compatibility.
+        
+        Checks nested path first, then falls back to flat key.
+        
+        Args:
+            key: Flat key name (e.g., 'date_start_end')
+            nested_path: Nested path (e.g., 'satellite.date_range')
+            
+        Returns:
+            Configuration value or None
+        """
+        if nested_path:
+            value = self.get(nested_path)
+            if value is not None:
+                return value
+        
+        # Fallback to flat key
+        return self._config.get(key)
     
     @property
     def config(self) -> Dict[str, Any]:
-        """Get the current configuration."""
-        return self._config.copy()
+        """
+        Get the current configuration.
+        
+        Returns a clean configuration without duplicate flat keys
+        that have been normalized to nested structure.
+        """
+        config_copy = self._config.copy()
+        
+        # Remove flat keys that have been normalized to nested structure
+        # to avoid confusion and duplicates
+        flat_keys_to_remove = [
+            'date_start_end',  # → satellite.date_range
+            'cloud_cover_threshold',  # → satellite.cloud_cover_threshold (if in satellite section)
+            'I_satellite',  # → satellite.provider
+            'region',  # → project.region (if in project section)
+            'high_forest',  # → fcd.thresholds.high_forest
+            'yrf_forest',  # → fcd.thresholds.yrf_forest
+            'shrub_grass',  # → fcd.thresholds.shrub_grass
+            'open_land',  # → fcd.thresholds.open_land
+        ]
+        
+        # Only remove if they exist in nested structure
+        for key in flat_keys_to_remove:
+            if key in config_copy:
+                # Check if normalized version exists
+                mappings = {
+                    'date_start_end': 'satellite.date_range',
+                    'cloud_cover_threshold': 'satellite.cloud_cover_threshold',
+                    'I_satellite': 'satellite.provider',
+                    'region': 'project.region',
+                    'high_forest': 'fcd.thresholds.high_forest',
+                    'yrf_forest': 'fcd.thresholds.yrf_forest',
+                    'shrub_grass': 'fcd.thresholds.shrub_grass',
+                    'open_land': 'fcd.thresholds.open_land',
+                }
+                nested_path = mappings.get(key)
+                if nested_path and self.get(nested_path) is not None:
+                    # Remove flat key if nested version exists
+                    del config_copy[key]
+        
+        return config_copy
     
     def get(self, key: str, default: Any = None) -> Any:
         """
         Get configuration value by key (supports dot notation).
         
+        Also supports backward compatibility for flat keys:
+        - 'date_start_end' → checks 'satellite.date_range' first
+        - 'cloud_cover_threshold' → checks 'satellite.cloud_cover_threshold' first
+        - 'I_satellite' → checks 'satellite.provider' first
+        - etc.
+        
         Args:
-            key: Configuration key (e.g., 'gee.project_id' or 'ml.algorithm')
+            key: Configuration key (e.g., 'gee.project_id' or 'ml.algorithm' or 'date_start_end')
             default: Default value if key not found
             
         Returns:
             Configuration value
         """
-        keys = key.split('.')
-        value = self._config
+        # Backward compatibility mapping for flat keys
+        flat_to_nested = {
+            'date_start_end': 'satellite.date_range',
+            'cloud_cover_threshold': 'satellite.cloud_cover_threshold',
+            'I_satellite': 'satellite.provider',
+            'region': 'project.region',
+            'high_forest': 'fcd.thresholds.high_forest',
+            'yrf_forest': 'fcd.thresholds.yrf_forest',
+            'shrub_grass': 'fcd.thresholds.shrub_grass',
+            'open_land': 'fcd.thresholds.open_land',
+        }
         
-        try:
-            for k in keys:
-                value = value[k]
-            return value
-        except (KeyError, TypeError):
-            return default
+        # If it's a flat key with a nested equivalent, check nested first
+        if key in flat_to_nested and '.' not in key:
+            nested_path = flat_to_nested[key]
+            keys = nested_path.split('.')
+            value = self._config
+            try:
+                for k in keys:
+                    value = value[k]
+                return value
+            except (KeyError, TypeError):
+                # Fall back to flat key
+                pass
+        
+        # Try as nested path (dot notation)
+        if '.' in key:
+            keys = key.split('.')
+            value = self._config
+            try:
+                for k in keys:
+                    value = value[k]
+                return value
+            except (KeyError, TypeError):
+                return default
+        
+        # Try as flat key
+        return self._config.get(key, default)
     
     def set(self, key: str, value: Any) -> None:
         """

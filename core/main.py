@@ -1292,5 +1292,458 @@ class ForestryCarbonARR:
         
         return ds_smoothed
     
+    def get_ds_sampled_mpc(
+        self,
+        ds_resampled: Optional['xr.Dataset'] = None,
+        zarr_path: Optional[str] = None,
+        years_back: int = 11,
+        days_offset: int = 15,
+        aoi_size_threshold_ha: float = 5000.0,
+        max_examples: int = 5,
+        max_retries: int = 3,
+        create_visualization: bool = True,
+        save_map: bool = False,
+        map_filename: Optional[str] = None,
+        storage: str = 'auto'
+    ) -> Dict[str, Any]:
+        """
+        Get sampled MPC (Microsoft Planetary Computer) data by analyzing duplicate STAC scenes.
+        
+        This method:
+        1. Loads or accepts ds_resampled dataset
+        2. Calculates MPC date range based on dataset's minimum date
+        3. Determines AOI size and approach (GEE vs STAC)
+        4. Searches for duplicate STAC scenes with different processing versions
+        5. Optionally creates visualization map
+        6. Returns analysis results
+        
+        Args:
+            ds_resampled: Pre-loaded xarray Dataset. If None, will load from zarr_path.
+            zarr_path: Path to zarr store containing ds_resampled. Required if ds_resampled is None.
+                Can be GCS path (gs://...) or local path.
+            years_back: Number of years to go back from end year for MPC date range. Default 11.
+            days_offset: Days to subtract from min_date for end date. Default 15.
+            aoi_size_threshold_ha: AOI size threshold in hectares to determine approach.
+                If AOI > threshold, uses GEE approach. Default 5000.0 ha.
+            max_examples: Maximum number of duplicate examples to show. Default 5.
+            max_retries: Maximum number of retry attempts for STAC search. Default 3.
+            create_visualization: Whether to create folium visualization map. Default True.
+            save_map: Whether to save the map as HTML file. Default False.
+            map_filename: Custom filename for the saved map. If None, auto-generates.
+            storage: Storage type for zarr ('auto', 'local', 'gcs'). Default 'auto'.
+        
+        Returns:
+            Dictionary with keys:
+                - 'use_gee': bool - Whether to use GEE approach based on AOI size
+                - 'aoi_ha': float - AOI area in hectares
+                - 'mpc_date_range': List[str] - [start_date, end_date] for MPC search
+                - 'selected_scene_data': Optional[Dict] - Selected duplicate scene data
+                - 'visualization': Optional[folium.Map] - Visualization map if created (display directly or save to HTML)
+                - 'bbox': shapely.geometry.box - Bounding box used for search
+                - 'aoi_gpd': GeoDataFrame - Area of interest GeoDataFrame
+                - 'aoi_ee': ee.Geometry - Earth Engine geometry for AOI
+                - 'ds_resampled': xr.Dataset - Resampled dataset
+                - 'mpc_urls': Dict[str, str] - Microsoft Planetary Computer Explorer URLs
+        """
+        import geopandas as gpd
+        from shapely.geometry import box
+        from ..utils.stac_utils import (
+            search_and_analyze_duplicate_stac_scenes,
+            create_unified_stac_visualization,
+            calculate_mpc_date_range
+        )
+        from ..utils.zarr_utils import load_dataset_zarr
+        from .utils import DataUtils
+        import os
+        
+        self.logger.info("=" * 60)
+        self.logger.info("MPC Eligibility Analysis")
+        self.logger.info("=" * 60)
+        
+        # Step 1: Load ds_resampled if not provided
+        if ds_resampled is None:
+            if zarr_path is None:
+                # Try to auto-detect from environment
+                zarr_path = os.getenv('GCS_ZARR_DIR', '')
+                if not zarr_path:
+                    raise ValueError("Either ds_resampled or zarr_path must be provided")
+                else:
+                    zarr_path = os.path.join(zarr_path, 'ds_resampled.zarr')
+            
+            self.logger.info(f"Loading ds_resampled from: {zarr_path}")
+            if storage == 'auto':
+                storage = 'gcs' if zarr_path.startswith('gs://') else 'local'
+            ds_resampled = load_dataset_zarr(zarr_path, storage=storage)
+        
+        # Step 2: Calculate MPC date range
+        self.logger.info("Calculating MPC date range from ds_resampled...")
+        start_date, end_date = calculate_mpc_date_range(
+            ds_resampled,
+            years_back=years_back,
+            days_offset=days_offset
+        )
+        mpc_date_range = [start_date, end_date]
+        self.logger.info(f"MPC date range: {mpc_date_range}")
+        
+        # Step 3: Load AOI and determine approach
+        self.logger.info("Loading AOI and determining approach...")
+        aoi_path = self.config.get('AOI_path')
+        if not aoi_path:
+            raise ValueError("AOI_path not found in config")
+        
+        # Step 4: Load AOI using DataUtils (returns original CRS, typically WGS84)
+        d = DataUtils(self.config, use_gee=True)
+        aoi_gpd, aoi_ee = d.load_geodataframe_gee(aoi_path)
+        
+        # Convert to output_crs only for area calculation (not for visualization)
+        output_crs = self.config.get('output_crs', 'EPSG:4326')
+        if ':' in output_crs:
+            epsg_code = int(output_crs.split(':')[-1])
+        else:
+            epsg_code = int(output_crs)
+        
+        # Calculate area in output_crs (UTM) for accurate area calculation
+        aoi_gpd_utm = aoi_gpd.to_crs(epsg=epsg_code)
+        aoi_ha = aoi_gpd_utm.geometry.area.sum() / 10000
+        
+        # Determine approach based on AOI size
+        use_gee = aoi_ha > aoi_size_threshold_ha
+        if use_gee:
+            self.logger.info(f"AOI area ({aoi_ha:.2f} ha) is too big, using GEE approach when available and mix with STAC MPC")
+        else:
+            self.logger.info(f"AOI area ({aoi_ha:.2f} ha) is small, using STAC (local process xarray) approach")
+        
+        # Step 5: Prepare config for STAC search
+        config_for_stac = self.config.copy()
+        config_for_stac['date_range_mpc'] = mpc_date_range
+        config_for_stac['collection_mpc'] = config_for_stac.get('collection_mpc', 'sentinel-2-l2a')
+        if 'url_satellite_cloud' not in config_for_stac:
+            config_for_stac['url_satellite_cloud'] = 'https://planetarycomputer.microsoft.com/api/stac/v1'
+        
+        # Step 6: Get bounding box (use original CRS from load_geodataframe_gee, typically WGS84)
+        # STAC data is in WGS84, so AOI should also be in WGS84 for visualization
+        bbox = box(*aoi_gpd.total_bounds)
+        
+        # Step 7: Search for duplicate STAC scenes
+        self.logger.info("Searching for duplicate STAC scenes...")
+        selected_scene_data = search_and_analyze_duplicate_stac_scenes(
+            config=config_for_stac,
+            bbox=bbox,
+            max_examples=max_examples,
+            max_retries=max_retries
+        )
+        
+        # Step 8: Create visualization if requested
+        # Use original AOI (WGS84) - no conversion needed, matches STAC CRS
+        visualization = None
+        if create_visualization:
+            self.logger.info("Creating visualization map...")
+            print("Creating visualization map...")
+            try:
+                visualization = create_unified_stac_visualization(
+                    gdf=aoi_gpd,  # Use original CRS (WGS84), matches STAC data
+                    bbox=bbox,
+                    scene_data=selected_scene_data,
+                    save_map=save_map,
+                    map_filename=map_filename
+                )
+                self.logger.info("✅ Visualization created")
+                print("✅ Visualization created")
+                self.logger.info(f"Visualization type: {type(visualization)}")
+                print(f"Visualization type: {type(visualization)}")
+                if visualization is None:
+                    self.logger.warning("⚠️ Visualization is None after creation!")
+                    print("⚠️ Visualization is None after creation!")
+            except Exception as e:
+                self.logger.error(f"Error creating visualization: {e}", exc_info=True)
+                print(f"❌ Error creating visualization: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Step 9: Generate Planetary Computer URLs
+        mpc_urls = self.get_planetary_computer_urls(bbox)
+        
+        # Step 10: Prepare results
+        results = {
+            'use_gee': use_gee,
+            'aoi_ha': aoi_ha,
+            'mpc_date_range': mpc_date_range,
+            'selected_scene_data': selected_scene_data,
+            'visualization': visualization,  # folium.Map object - display directly or save to HTML
+            'bbox': bbox,
+            'aoi_gpd': aoi_gpd,
+            'aoi_ee': aoi_ee,
+            'ds_resampled': ds_resampled,
+            'mpc_urls': mpc_urls
+        }
+        
+        self.logger.info("=" * 60)
+        self.logger.info("✅ MPC Eligibility Analysis Complete")
+        self.logger.info("=" * 60)
+        
+        return results
+    
+    def get_planetary_computer_urls(self, bbox) -> Dict[str, str]:
+        """
+        Generate Microsoft Planetary Computer Explorer URLs for the given bounding box.
+        
+        These URLs use the correct format that Microsoft Planetary Computer Explorer
+        actually uses, allowing direct viewing of satellite data.
+        
+        Args:
+            bbox: shapely.geometry.box - Bounding box for the area of interest
+            
+        Returns:
+            Dictionary with URL names as keys and URLs as values:
+            - "🛰️ Sentinel-2 L2A (Natural Color)"
+            - "🛰️ Sentinel-2 L2A (False Color)"
+            - "🛰️ Landsat 8-9 (Natural Color)"
+        """
+        # Get center coordinates
+        center_lat = (bbox.bounds[1] + bbox.bounds[3]) / 2
+        center_lon = (bbox.bounds[0] + bbox.bounds[2]) / 2
+        
+        # URLs in the correct format (based on Microsoft Planetary Computer Explorer format)
+        urls = {
+            "🛰️ Sentinel-2 L2A (Natural Color)": f"https://planetarycomputer.microsoft.com/explore?c={center_lon}%2C{center_lat}&z=12&v=2&d=sentinel-2-l2a&s=false%3A%3A100%3A%3Atrue&ae=0&sr=desc&m=Most+recent+%28low+cloud%29&r=Natural+color",
+            "🛰️ Sentinel-2 L2A (False Color)": f"https://planetarycomputer.microsoft.com/explore?c={center_lon}%2C{center_lat}&z=12&v=2&d=sentinel-2-l2a&s=false%3A%3A100%3A%3Atrue&ae=0&sr=desc&m=Most+recent+%28low+cloud%29&r=Short+wave+infrared",
+            "🛰️ Landsat 8-9 (Natural Color)": f"https://planetarycomputer.microsoft.com/explore?c={center_lon}%2C{center_lat}&z=12&v=2&d=landsat-c2-l2&s=false%3A%3A100%3A%3Atrue&ae=0&sr=desc&m=Most+recent+%28low+cloud%29&r=Natural+color",
+        }
+        
+        # Print formatted output
+        self.logger.info("🔗 MICROSOFT PLANETARY COMPUTER URLs")
+        self.logger.info("=" * 60)
+        self.logger.info(f"📍 Your area center: {center_lat:.4f}, {center_lon:.4f}")
+        self.logger.info(f"📍 Bbox: {bbox.bounds}")
+        
+        print("🔗 MICROSOFT PLANETARY COMPUTER URLs")
+        print("=" * 60)
+        print(f"📍 Your area center: {center_lat:.4f}, {center_lon:.4f}")
+        print(f"📍 Bbox: {bbox.bounds}")
+        print()
+        
+        for name, url in urls.items():
+            self.logger.info(f"{name}: {url}")
+            print(f"{name}:")
+            print(f"  {url}")
+            print()
+        
+        print("💡 These URLs use the correct format and should show satellite data directly!")
+        print("🎯 Based on your working URL format from manual interaction")
+        
+        return urls
+    
+    def get_satellite_mpc(
+        self,
+        bbox: Optional[Any] = None,
+        date_range_mpc: Optional[List[str]] = None,
+        utm_crs: Optional[str] = None,
+        pixel_scale: Optional[int] = None,
+        zarr_path: Optional[str] = None,
+        chunk_sizes: Optional[Dict[str, int]] = None,
+        compression: str = 'lz4',
+        compression_level: int = 1,
+        overwrite_zarr: bool = False,
+        save_to_zarr: bool = True,
+        storage: str = 'auto',
+        show_progress: bool = True
+    ) -> 'xr.Dataset':
+        """
+        Download and process satellite data from Microsoft Planetary Computer (MPC) using STAC.
+        
+        This method:
+        1. Searches for satellite data using STAC with the provided date range
+        2. Downloads and processes the data (cloud masking, band renaming)
+        3. Reprojects to UTM CRS (if specified or auto-calculated)
+        4. Saves to zarr (local or GCS) if requested
+        
+        Supports multiple satellite types (Sentinel-2, Landsat, etc.) based on configuration.
+        
+        Args:
+            bbox: Bounding box (shapely.geometry.box). If None, uses bbox from get_ds_sampled_mpc results.
+            date_range_mpc: Date range for STAC search [start_date, end_date] (e.g., ['2017-01-01', '2024-12-31']).
+                If None, uses date_range_mpc from get_ds_sampled_mpc results.
+            utm_crs: Target UTM CRS (e.g., 'EPSG:32749'). If None, auto-calculates from AOI.
+            pixel_scale: Pixel scale in meters for reprojection. If None, uses default from config (10m for Sentinel-2, 30m for Landsat).
+            zarr_path: Output zarr path. If None, auto-generates from config.
+            chunk_sizes: Chunk sizes for zarr storage. Default: {'time': 10, 'x': 512, 'y': 512}.
+            compression: Compression algorithm ('lz4', 'blosc', 'zstd', or None). Default 'lz4'.
+            compression_level: Compression level (1-9). Default 1.
+            overwrite_zarr: Whether to overwrite existing zarr store. Default False.
+            save_to_zarr: Whether to save to zarr. Default True.
+            storage: Storage type ('auto', 'local', 'gcs'). Default 'auto'.
+            show_progress: Whether to show progress bars. Default True.
+        
+        Returns:
+            xr.Dataset: Processed satellite data in UTM projection
+        
+        Raises:
+            ValueError: If bbox or date_range_mpc not provided and not available from previous results.
+        """
+        try:
+            import xarray as xr
+            import geopandas as gpd
+            import rasterio
+            from shapely.geometry import box
+            from ..stac.stac_processor import STACProcessor
+            from ..utils.zarr_utils import save_dataset_efficient_zarr, load_dataset_zarr
+            from ..utils.gee_processing import calculate_utm_crs, get_pixel_scale
+        except ImportError as e:
+            raise DependencyError(f"Required dependencies not available: {e}")
+        
+        self.logger.info("=" * 60)
+        self.logger.info("🛰️  DOWNLOADING SATELLITE DATA FROM MPC")
+        self.logger.info("=" * 60)
+        print("🛰️  DOWNLOADING SATELLITE DATA FROM MPC")
+        print("=" * 60)
+        
+        # Step 1: Get bbox and date_range_mpc
+        if bbox is None:
+            # Try to get from previous results if available
+            if hasattr(self, '_last_mpc_results') and 'bbox' in self._last_mpc_results:
+                bbox = self._last_mpc_results['bbox']
+                self.logger.info("Using bbox from previous get_ds_sampled_mpc results")
+                print("📦 Using bbox from previous get_ds_sampled_mpc results")
+            else:
+                raise ValueError("bbox is required. Provide bbox parameter or run get_ds_sampled_mpc first.")
+        
+        if date_range_mpc is None:
+            # Try to get from previous results if available
+            if hasattr(self, '_last_mpc_results') and 'mpc_date_range' in self._last_mpc_results:
+                date_range_mpc = self._last_mpc_results['mpc_date_range']
+                self.logger.info("Using date_range_mpc from previous get_ds_sampled_mpc results")
+                print("📅 Using date_range_mpc from previous get_ds_sampled_mpc results")
+            else:
+                raise ValueError("date_range_mpc is required. Provide date_range_mpc parameter or run get_ds_sampled_mpc first.")
+        
+        # Format date range for STAC (e.g., "2017-01-01/2024-12-31")
+        if isinstance(date_range_mpc, list) and len(date_range_mpc) == 2:
+            datetime_range_str = f"{date_range_mpc[0]}/{date_range_mpc[1]}"
+        else:
+            datetime_range_str = str(date_range_mpc)
+        
+        self.logger.info(f"Date range: {datetime_range_str}")
+        print(f"📅 Date range: {datetime_range_str}")
+        
+        # Step 2: Check if zarr already exists
+        if zarr_path and save_to_zarr and not overwrite_zarr:
+            try:
+                ds = load_dataset_zarr(zarr_path, storage=storage)
+                self.logger.info(f"✅ Loaded existing dataset from zarr: {zarr_path}")
+                print(f"✅ Loaded existing dataset from zarr: {zarr_path}")
+                return ds
+            except (FileNotFoundError, Exception) as e:
+                self.logger.info(f"Zarr not found or error loading: {e}. Proceeding with download...")
+                print(f"📥 Zarr not found. Proceeding with download...")
+        
+        # Step 3: Initialize STAC processor
+        stac_processor = STACProcessor(self.config)
+        
+        # Step 4: Process satellite data (download, cloud masking, band renaming)
+        self.logger.info("Processing satellite data from STAC...")
+        print("📡 Processing satellite data from STAC...")
+        ds_stac = stac_processor.process_satellite_data(
+            bbox=bbox,
+            out_path=None,  # We'll handle zarr saving ourselves
+            show_progress=show_progress,
+            datetime_range=datetime_range_str
+        )
+        
+        self.logger.info(f"✅ STAC data processed: {dict(ds_stac.sizes)}")
+        print(f"✅ STAC data processed: {dict(ds_stac.sizes)}")
+        
+        # Step 5: Reproject to UTM if needed
+        if utm_crs is None:
+            # Calculate UTM CRS from bbox
+            aoi_gdf = gpd.GeoDataFrame(geometry=[bbox], crs='EPSG:4326')
+            utm_crs, utm_epsg, hemisphere = calculate_utm_crs(aoi_gdf)
+            self.logger.info(f"Auto-calculated UTM CRS: {utm_crs}")
+            print(f"🗺️  Auto-calculated UTM CRS: {utm_crs}")
+        else:
+            utm_epsg = int(utm_crs.split(':')[1]) if ':' in utm_crs else int(utm_crs)
+        
+        if pixel_scale is None:
+            pixel_scale = get_pixel_scale(self.config.get('I_satellite', 'Sentinel'))
+            self.logger.info(f"Using pixel scale: {pixel_scale}m")
+            print(f"📏 Pixel scale: {pixel_scale}m")
+        
+        # Check current CRS
+        current_crs = ds_stac.rio.crs if hasattr(ds_stac, 'rio') and hasattr(ds_stac.rio, 'crs') else None
+        if current_crs is None:
+            # Try to get from spatial_ref coordinate
+            if 'spatial_ref' in ds_stac.coords:
+                current_crs = ds_stac.spatial_ref.attrs.get('crs_wkt', None)
+        
+        # Reproject if needed
+        if current_crs is None or str(current_crs) != utm_crs:
+            self.logger.info(f"Reprojecting from {current_crs} to {utm_crs}...")
+            print(f"🔄 Reprojecting to {utm_crs}...")
+            
+            try:
+                # Use rioxarray for reprojection
+                if not hasattr(ds_stac, 'rio'):
+                    import rioxarray
+                    # Set CRS if not already set
+                    if current_crs is None:
+                        # Try to infer from coordinates
+                        if 'spatial_ref' in ds_stac.coords:
+                            ds_stac = ds_stac.rio.write_crs(ds_stac.spatial_ref.attrs.get('crs_wkt', 'EPSG:4326'))
+                        else:
+                            # Default to WGS84 if unknown
+                            ds_stac = ds_stac.rio.write_crs('EPSG:4326')
+                
+                # Reproject to UTM
+                ds_utm = ds_stac.rio.reproject(
+                    dst_crs=utm_crs,
+                    resolution=pixel_scale,
+                    resampling=rasterio.enums.Resampling.bilinear
+                )
+                
+                self.logger.info(f"✅ Reprojected to {utm_crs}")
+                print(f"✅ Reprojected to {utm_crs}")
+                ds_stac = ds_utm
+            except Exception as e:
+                self.logger.warning(f"Reprojection failed: {e}. Using original CRS.")
+                print(f"⚠️  Reprojection failed: {e}. Using original CRS.")
+        
+        # Step 6: Save to zarr if requested
+        if save_to_zarr:
+            if zarr_path is None:
+                # Auto-generate zarr path
+                project_name = self.config.get('project_name', 'forestry_project')
+                if storage == 'gcs' or (storage == 'auto' and os.getenv('GCS_ZARR_DIR')):
+                    gcs_dir = os.getenv('GCS_ZARR_DIR', 'gs://remote_sensing_saas')
+                    zarr_path = f"{gcs_dir}/{project_name}/satellite_mpc.zarr"
+                else:
+                    zarr_path = f"data/satellite_mpc/{project_name}_satellite_mpc.zarr"
+            
+            self.logger.info(f"Saving to zarr: {zarr_path}")
+            print(f"💾 Saving to zarr: {zarr_path}")
+            
+            if chunk_sizes is None:
+                chunk_sizes = {'time': 10, 'x': 512, 'y': 512}
+            
+            save_dataset_efficient_zarr(
+                ds=ds_stac,
+                zarr_path=zarr_path,
+                chunk_sizes=chunk_sizes,
+                compression=compression,
+                compression_level=compression_level,
+                overwrite=overwrite_zarr,
+                storage=storage
+            )
+            
+            self.logger.info("✅ Dataset saved to zarr")
+            print("✅ Dataset saved to zarr")
+        
+        self.logger.info("=" * 60)
+        self.logger.info("✅ MPC SATELLITE DATA DOWNLOAD COMPLETE")
+        self.logger.info("=" * 60)
+        print("=" * 60)
+        print("✅ MPC SATELLITE DATA DOWNLOAD COMPLETE")
+        print("=" * 60)
+        
+        return ds_stac
+    
     def __repr__(self) -> str:
         return f"ForestryCarbonARR(gee_forestry_available={self._gee_forestry_available}, strategy={self._import_strategy})"

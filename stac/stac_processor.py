@@ -43,12 +43,14 @@ class STACProcessor:
         self.config = config_manager
         self.satellite_config = config_manager.get_stac_config()
     
-    def search_satellite_data(self, bbox: box) -> list:
+    def search_satellite_data(self, bbox: box, datetime_range: Optional[str] = None) -> list:
         """
         Search for satellite data using STAC.
         
         Args:
             bbox (box): Bounding box for search
+            datetime_range (Optional[str]): Date range for search (e.g., "2017-01-01/2024-12-31").
+                If None, uses datetime from config.
             
         Returns:
             list: List of STAC items found
@@ -57,6 +59,10 @@ class STACProcessor:
             ValueError: If no satellite images found
         """
         logger.info("Searching for satellite data using STAC...")
+        
+        # Use provided datetime_range or fall back to config
+        datetime_param = datetime_range if datetime_range is not None else self.satellite_config['datetime']
+        logger.info(f"Using date range: {datetime_param}")
                 
         # STAC Search
         catalog = pystac_client.Client.open(
@@ -67,7 +73,7 @@ class STACProcessor:
         search = catalog.search(
             collections=[self.satellite_config['collection']],
             intersects=to_geojson(bbox),
-            datetime=self.satellite_config['datetime'],
+            datetime=datetime_param,
             query={"eo:cloud_cover": {"lt": self.satellite_config['cloud_cover']}},
         )
         
@@ -293,7 +299,8 @@ class STACProcessor:
             raise FileNotFoundError(f"Zarr file not found: {zarr_path}")
     
     def process_satellite_data(self, bbox: box, out_path: Optional[str] = None, 
-                              show_progress: bool = True, gcp_bucket=None) -> xr.Dataset:
+                              show_progress: bool = True, gcp_bucket=None,
+                              datetime_range: Optional[str] = None) -> xr.Dataset:
         """
         Simple STAC-based satellite data processing pipeline.
         
@@ -301,6 +308,9 @@ class STACProcessor:
             bbox (box): Bounding box for data extraction
             out_path (Optional[str]): Output path for Zarr storage
             show_progress (bool): Whether to show progress bars
+            gcp_bucket: GCP bucket for storage (deprecated, use out_path with gs://)
+            datetime_range (Optional[str]): Date range for search (e.g., "2017-01-01/2024-12-31").
+                If None, uses datetime from config.
             
         Returns:
             xr.Dataset: Processed satellite data
@@ -329,7 +339,7 @@ class STACProcessor:
             # Step 1: Search for satellite data
             step_start = time.time()
             print("🔍 Step 1/5: Searching for satellite data...")
-            items = self.search_satellite_data(bbox)
+            items = self.search_satellite_data(bbox, datetime_range=datetime_range)
             step_time = time.time() - step_start
             print(f"✅ Found {len(items)} images in {step_time:.1f}s")
             
