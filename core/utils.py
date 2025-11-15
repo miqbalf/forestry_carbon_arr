@@ -86,6 +86,94 @@ def create_fresh_stac_client(config):
     return catalog
 
 
+def initialize_gee(project_id: Optional[str] = None) -> None:
+    """
+    Initialize Google Earth Engine using the forestry library's initialization pattern.
+    
+    This function follows the same initialization logic as ForestryCarbonARR:
+    1. Tries gee_lib auth first (container environment)
+    2. Falls back to direct GEE initialization
+    
+    Args:
+        project_id: Optional Google Cloud project ID. If None, uses GOOGLE_CLOUD_PROJECT env var.
+    
+    Raises:
+        RuntimeError: If GEE initialization fails
+        ImportError: If Earth Engine library is not available
+    """
+    if not GEE_AVAILABLE:
+        raise ImportError("Earth Engine library not available. Install with: pip install earthengine-api geemap")
+    
+    try:
+        import ee
+        from dotenv import load_dotenv
+        
+        # Load environment variables
+        load_dotenv()
+        
+        # Check if already initialized
+        try:
+            # Try to get a simple property to check if initialized
+            _ = ee.Number(1).getInfo()
+            logger.info("GEE already initialized")
+            return
+        except Exception:
+            # Not initialized, continue
+            pass
+        
+        logger.info("Initializing Google Earth Engine...")
+        
+        # Try to import gee_lib auth if available (container environment)
+        try:
+            # Try gee_lib auth (container environment)
+            try:
+                from gee_lib.osi.auth import initialize_gee as gee_lib_initialize
+                project = project_id or os.getenv('GOOGLE_CLOUD_PROJECT')
+                if project:
+                    gee_lib_initialize(project_id=project, use_service_account=True)
+                    logger.info("GEE initialized successfully using gee_lib auth")
+                    return
+                else:
+                    logger.warning("GOOGLE_CLOUD_PROJECT not set, falling back to direct initialization")
+            except ImportError:
+                logger.debug("gee_lib.osi.auth not available, trying direct initialization")
+            
+            # Fallback to direct GEE initialization
+            try:
+                if project_id:
+                    ee.Initialize(project=project_id)
+                else:
+                    project = os.getenv('GOOGLE_CLOUD_PROJECT')
+                    if project:
+                        ee.Initialize(project=project)
+                    else:
+                        ee.Initialize()
+                logger.info("GEE initialized directly")
+            except Exception as init_error:
+                logger.error(f"Failed to initialize GEE directly: {init_error}")
+                raise RuntimeError(f"Failed to initialize GEE: {init_error}")
+                
+        except Exception as e:
+            logger.warning(f"Could not use gee_lib auth: {e}. Attempting direct GEE initialization...")
+            # Final fallback to direct initialization
+            try:
+                if project_id:
+                    ee.Initialize(project=project_id)
+                else:
+                    project = os.getenv('GOOGLE_CLOUD_PROJECT')
+                    if project:
+                        ee.Initialize(project=project)
+                    else:
+                        ee.Initialize()
+                logger.info("GEE initialized directly (fallback)")
+            except Exception as init_error:
+                logger.error(f"Failed to initialize GEE (fallback): {init_error}")
+                raise RuntimeError(f"Failed to initialize GEE: {init_error}")
+    
+    except ImportError:
+        raise ImportError("Earth Engine library not available. Install with: pip install earthengine-api geemap")
+
+
 class DataUtils:
     """
     Utility functions for data processing and analysis.

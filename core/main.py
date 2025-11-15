@@ -179,6 +179,86 @@ class ForestryCarbonARR:
         else:
             return "GEE_notebook_Forestry not available. Please check setup requirements."
     
+    def initialize_gee(self, project_id: Optional[str] = None) -> None:
+        """
+        Initialize Google Earth Engine using the forestry library's initialization pattern.
+        
+        This method follows the same initialization logic used in run_eligibility():
+        1. Tries gee_lib auth first (container environment)
+        2. Falls back to direct GEE initialization
+        
+        Args:
+            project_id: Optional Google Cloud project ID. If None, uses GOOGLE_CLOUD_PROJECT env var.
+        
+        Raises:
+            ForestryCarbonError: If GEE initialization fails
+        """
+        try:
+            import ee
+            from dotenv import load_dotenv
+            
+            # Load environment variables
+            load_dotenv()
+            
+            # Check if already initialized
+            try:
+                # Try to get a simple property to check if initialized
+                _ = ee.Number(1).getInfo()
+                self.logger.info("GEE already initialized")
+                return
+            except Exception:
+                # Not initialized, continue
+                pass
+            
+            self.logger.info("Initializing Google Earth Engine...")
+            
+            # Try to import gee_lib auth if available
+            try:
+                # Try gee_lib auth (container environment)
+                try:
+                    from gee_lib.osi.auth import initialize_gee
+                    project = project_id or os.getenv('GOOGLE_CLOUD_PROJECT')
+                    if project:
+                        initialize_gee(project_id=project, use_service_account=True)
+                        self.logger.info("GEE initialized successfully using gee_lib auth")
+                        return
+                    else:
+                        raise ValueError("GOOGLE_CLOUD_PROJECT not set")
+                except ImportError:
+                    # Fallback to direct GEE initialization
+                    try:
+                        if project_id:
+                            ee.Initialize(project=project_id)
+                        else:
+                            project = os.getenv('GOOGLE_CLOUD_PROJECT')
+                            if project:
+                                ee.Initialize(project=project)
+                            else:
+                                ee.Initialize()
+                        self.logger.info("GEE initialized directly")
+                    except Exception as init_error:
+                        self.logger.error(f"Failed to initialize GEE: {init_error}")
+                        raise ForestryCarbonError(f"Failed to initialize GEE: {init_error}")
+            except Exception as e:
+                self.logger.warning(f"Could not use gee_lib auth: {e}. Attempting direct GEE initialization...")
+                # Fallback to direct initialization
+                try:
+                    if project_id:
+                        ee.Initialize(project=project_id)
+                    else:
+                        project = os.getenv('GOOGLE_CLOUD_PROJECT')
+                        if project:
+                            ee.Initialize(project=project)
+                        else:
+                            ee.Initialize()
+                    self.logger.info("GEE initialized directly (fallback)")
+                except Exception as init_error:
+                    self.logger.error(f"Failed to initialize GEE: {init_error}")
+                    raise ForestryCarbonError(f"Failed to initialize GEE: {init_error}")
+        
+        except ImportError:
+            raise ForestryCarbonError("Earth Engine library not available. Install with: pip install earthengine-api geemap")
+    
     def run_eligibility(self, 
                         config: Dict[str, Any],
                         use_gee: bool = True,
@@ -344,38 +424,7 @@ class ForestryCarbonARR:
                     raise ForestryCarbonError(f"Failed to import OSI modules: {e}")
             
             # Step 1: Initialize GEE
-            self.logger.info("Initializing Google Earth Engine...")
-            from dotenv import load_dotenv
-            load_dotenv()
-            
-            # Try to import gee_lib auth if available
-            try:
-                # Try gee_lib auth (container environment)
-                try:
-                    from gee_lib.osi.auth import initialize_gee
-                    project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
-                    if project_id:
-                        initialize_gee(project_id=project_id, use_service_account=True)
-                        self.logger.info("GEE initialized successfully using gee_lib auth")
-                    else:
-                        raise ValueError("GOOGLE_CLOUD_PROJECT not set")
-                except ImportError:
-                    # Fallback to direct GEE initialization
-                    try:
-                        ee.Initialize()
-                        self.logger.info("GEE initialized directly")
-                    except Exception as init_error:
-                        self.logger.error(f"Failed to initialize GEE: {init_error}")
-                        raise ForestryCarbonError(f"Failed to initialize GEE: {init_error}")
-            except Exception as e:
-                self.logger.warning(f"Could not use gee_lib auth: {e}. Attempting direct GEE initialization...")
-                # Fallback to direct initialization
-                try:
-                    ee.Initialize()
-                    self.logger.info("GEE initialized directly (fallback)")
-                except Exception as init_error:
-                    self.logger.error(f"Failed to initialize GEE: {init_error}")
-                    raise ForestryCarbonError(f"Failed to initialize GEE: {init_error}")
+            self.initialize_gee()
             
             # Step 2: Load and validate AOI
             self.logger.info("Loading AOI...")

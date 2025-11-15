@@ -937,15 +937,19 @@ def process_collection_with_indices_and_smoothing(
     spectral_bands: Optional[List[str]] = None,
     smoothing_window: int = 3,
     smoothing_polyorder: int = 2,
-    add_fcd: bool = False
+    add_fcd: bool = False,
+    outlier_window: int = 14,
+    outlier_threshold: float = 0.1
 ) -> ee.ImageCollection:
     """
     High-level function to add spectral indices and apply smoothing.
     
-    This function combines:
-    1. Add spectral indices
+    This function follows the same workflow as notebook 02b:
+    1. Add spectral indices (NDVI, NDWI, MSAVI2, MTVI2, VARI, BSI, EVI)
     2. Optionally add FCD indices
-    3. Apply Savitzky-Golay smoothing
+    3. Remove outliers (drops and spikes) using rolling median
+    4. Interpolate temporal gaps
+    5. Apply Savitzky-Golay smoothing
     
     Parameters
     ----------
@@ -956,14 +960,18 @@ def process_collection_with_indices_and_smoothing(
     aoi_ee : ee.Geometry
         AOI Earth Engine geometry
     spectral_bands : list, optional
-        List of spectral bands to smooth. If None, uses ['NDVI'].
+        List of spectral bands to smooth. If None, uses ['NDVI', 'EVI'].
         Note: Only bands that exist in the collection will be smoothed.
     smoothing_window : int
-        Window length for smoothing. Default 3.
+        Window length for Savitzky-Golay smoothing. Default 3.
     smoothing_polyorder : int
-        Polynomial order for smoothing. Default 2.
+        Polynomial order for Savitzky-Golay smoothing. Default 2.
     add_fcd : bool
         Whether to add FCD indices. Default False.
+    outlier_window : int
+        Window size for outlier detection (rolling median). Default 14.
+    outlier_threshold : float
+        Threshold percentage for outlier detection (0.1 = 10%). Default 0.1.
     
     Returns
     -------
@@ -1046,24 +1054,50 @@ def process_collection_with_indices_and_smoothing(
         logger.warning(f"Some requested bands are not available: {missing}")
         logger.info(f"Will smooth only: {valid_bands}")
     
-    logger.info(f"Step 3: Applying Savitzky-Golay smoothing...")
+    # Step 3: Remove outliers (drops and spikes) - following 02b workflow
+    logger.info(f"Step 3: Removing outliers using rolling median...")
+    logger.info(f"   Outlier window: {outlier_window} images")
+    logger.info(f"   Outlier threshold: {outlier_threshold * 100}%")
+    logger.info(f"   Bands to process: {valid_bands}")
+
+    collection_no_outliers = remove_drops_and_spikes_gee(
+        image_collection=collection_with_indices,
+        band_names=valid_bands,
+        window_size=outlier_window,
+        threshold_percent=outlier_threshold
+    )
+    logger.info("✅ Outlier removal complete!")
+
+    # Step 4: Interpolate temporal gaps - following 02b workflow
+    logger.info(f"Step 4: Interpolating gaps in time series...")
+    logger.info(f"   This fills missing dates/intervals, similar to XArray np.interp()")
+    
+    collection_interpolated = interpolate_temporal_gaps(
+        collection_no_outliers,
+        band_names=valid_bands
+    )
+    logger.info("✅ Gap interpolation complete!")
+    
+    # Step 5: Apply Savitzky-Golay smoothing - following 02b workflow
+    logger.info(f"Step 5: Applying Savitzky-Golay filtering...")
     logger.info(f"   Window length: {smoothing_window}")
     logger.info(f"   Polynomial order: {smoothing_polyorder}")
     logger.info(f"   Bands to filter: {valid_bands}")
     
     collection_with_sg = savgol_filter(
-        collection_with_indices,
+        collection_interpolated,
         band_names=valid_bands,
         window_length=smoothing_window,
         polyorder=smoothing_polyorder
     )
     
-    # Select only smoothed bands for final collection
+    # IMPORTANT: Explicitly select only the bands we need (following 02b)
     collection_with_sg = collection_with_sg.map(
         lambda img: img.select(valid_bands)
     )
     
-    logger.info("✅ Smoothing complete")
+    logger.info("✅ Savitzky-Golay filtering complete!")
+    logger.info(f"   Filtered bands: {valid_bands}")
     
     return collection_with_sg
 

@@ -130,6 +130,11 @@ class ConfigManager:
             if key not in flat_keys_to_remove:
                 normalized[key] = value
         
+        # For backward compatibility, also add I_satellite to flat dict
+        # even though it's mapped to satellite.provider
+        if 'I_satellite' in flat_config:
+            normalized['I_satellite'] = flat_config['I_satellite']
+        
         return normalized
     
     def _merge_config(self, new_config: Dict[str, Any]) -> None:
