@@ -9,6 +9,7 @@ This module provides utilities for processing GEE ImageCollections including:
 - Spectral indices addition
 - Temporal smoothing and filtering
 - Outlier removal
+- Time series extraction and visualization
 """
 
 import ee
@@ -19,6 +20,14 @@ import geopandas as gpd
 from typing import List, Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Optional import for plotting
+try:
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+    logger.warning("matplotlib not available. Plotting functions will not work.")
 
 
 def calculate_utm_crs(aoi_gpd: gpd.GeoDataFrame) -> Tuple[str, int, str]:
@@ -982,6 +991,29 @@ def process_collection_with_indices_and_smoothing(
     logger.info("Processing collection: indices + smoothing")
     logger.info("=" * 60)
     
+    # Check if collection has system:time_start property (required for monthly composites)
+    try:
+        first_img = collection.first()
+        time_start = first_img.get('system:time_start').getInfo()
+        if time_start is None:
+            logger.warning(
+                "⚠️  Collection images do not have 'system:time_start' property. "
+                "This may cause issues with time-based operations. "
+                "Monthly composites created with create_monthly_composites() should have this property set."
+            )
+        else:
+            logger.info(f"✅ Collection has system:time_start property (first image: {pd.to_datetime(time_start, unit='ms').strftime('%Y-%m-%d')})")
+    except Exception as e:
+        if "does not have a 'system:time_start' property" in str(e) or "system:time_start" in str(e):
+            logger.warning(
+                "⚠️  Collection images do not have 'system:time_start' property. "
+                "This may cause issues with time-based operations. "
+                "Monthly composites created with create_monthly_composites() should have this property set. "
+                f"Error: {e}"
+            )
+        else:
+            logger.warning(f"⚠️  Could not verify system:time_start property: {e}")
+    
     # Prepare spectral config
     spectral_config = {
         'I_satellite': config['I_satellite'],
@@ -1240,3 +1272,384 @@ def savgol_filter(
     
     return result_collection
 
+
+def extract_time_series_for_visualization(
+    collection_before: ee.ImageCollection,
+    collection_after: ee.ImageCollection,
+    sample_point: ee.Geometry,
+    bands: List[str],
+    scale: float = 10,
+    max_pixels: int = 1e10,
+    best_effort: bool = True
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Extract point-based time series from two EE ImageCollections (before/after processing).
+    
+    This function extracts time series data from two ImageCollections at a sample point,
+    typically used to compare original vs processed (e.g., smoothed) data for visualization.
+    
+    **Note:** This function requires that images in the collections have `system:time_start`
+    property set. Monthly composites created with `create_monthly_composites()` already
+    have this property set.
+    
+    Parameters
+    ----------
+    collection_before : ee.ImageCollection
+        Original collection (e.g., before Savitzky-Golay smoothing).
+        Must have `system:time_start` property on each image.
+    collection_after : ee.ImageCollection
+        Processed collection (e.g., after Savitzky-Golay smoothing).
+        Must have `system:time_start` property on each image.
+    sample_point : ee.Geometry
+        Point geometry at which to sample the time series (e.g., ee.Geometry.Point([lon, lat])).
+    bands : list[str]
+        Band names to extract (must exist in both collections), e.g., ['NDVI', 'EVI'].
+    scale : float, optional
+        Scale in meters for reduceRegion (default: 10).
+    max_pixels : int, optional
+        maxPixels for reduceRegion (default: 1e10).
+    best_effort : bool, optional
+        bestEffort flag for reduceRegion (default: True).
+    
+    Returns
+    -------
+    tuple
+        (df_before, df_after) - Two pandas DataFrames with columns ['date', *bands],
+        sorted chronologically and ready for plotting.
+    
+    Raises
+    ------
+    ValueError
+        If images in the collection don't have `system:time_start` property.
+    
+    Examples
+    --------
+    >>> sample_point = ee.Geometry.Point([111.81746, -0.41587])
+    >>> bands = ['NDVI', 'EVI']
+    >>> df_before, df_after = extract_time_series_for_visualization(
+    ...     collection_before=collection_with_indices,
+    ...     collection_after=collection_with_sg,
+    ...     sample_point=sample_point,
+    ...     bands=bands,
+    ...     scale=10
+    ... )
+    """
+    logger.info("=" * 60)
+    logger.info("Extracting time series for visualization")
+    logger.info("=" * 60)
+    
+    # Check if first image has system:time_start property
+    def _check_time_start(collection: ee.ImageCollection, label: str) -> None:
+        """Check if collection has system:time_start property."""
+        try:
+            first_img = collection.first()
+            time_start = first_img.get('system:time_start').getInfo()
+            if time_start is None:
+                raise ValueError(
+                    f"{label} collection images do not have 'system:time_start' property. "
+                    f"Monthly composites should have this property set. "
+                    f"Please ensure images are created with create_monthly_composites() "
+                    f"or have system:time_start set manually."
+                )
+            logger.info(f"   ✅ {label} collection has system:time_start property")
+        except Exception as e:
+            if "does not have a 'system:time_start' property" in str(e) or "system:time_start" in str(e):
+                raise ValueError(
+                    f"{label} collection images do not have 'system:time_start' property. "
+                    f"Monthly composites should have this property set. "
+                    f"Please ensure images are created with create_monthly_composites() "
+                    f"or have system:time_start set manually."
+                ) from e
+            raise
+    
+    _check_time_start(collection_before, "BEFORE")
+    _check_time_start(collection_after, "AFTER")
+    
+    def _extract_point_timeseries(collection: ee.ImageCollection, label: str) -> pd.DataFrame:
+        """
+        Extract point-based time series from a single ImageCollection.
+        
+        Parameters
+        ----------
+        collection : ee.ImageCollection
+            Collection to extract from (must have system:time_start property).
+        label : str
+            Label for logging (e.g., "BEFORE" or "AFTER").
+        
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with columns ['date', *bands].
+        """
+        logger.info(f"   Extracting {label} time series...")
+        
+        def reducer(img: ee.Image) -> ee.Feature:
+            """Reduce image to point statistics."""
+            img_selected = img.select(bands)
+            stats = img_selected.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=sample_point,
+                scale=scale,
+                bestEffort=best_effort,
+                maxPixels=max_pixels,
+            )
+            
+            # Get date from image (requires system:time_start property)
+            date_str = img.date().format('YYYY-MM-dd')
+            props = {'date': date_str}
+            for band in bands:
+                props[band] = stats.get(band)
+            return ee.Feature(sample_point, props)
+        
+        features = collection.map(reducer)
+        rows = features.getInfo()['features']
+        data = []
+        
+        for feat in rows:
+            props = feat['properties']
+            row = {'date': props.get('date')}
+            for band in bands:
+                row[band] = props.get(band)
+            data.append(row)
+        
+        df = pd.DataFrame(data)
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date').reset_index(drop=True)
+        df = df.replace([None, -9999], np.nan)
+        
+        logger.info(f"   ✅ Converted {label}: {len(df)} time steps")
+        return df
+    
+    # Log extraction parameters
+    point_coords = sample_point.getInfo()['coordinates']
+    logger.info(f"   Sample point: {point_coords}")
+    logger.info(f"   Bands to compare: {', '.join(bands)}")
+    
+    logger.info("\n   Comparison:")
+    logger.info("   1. BEFORE: original collection")
+    logger.info("   2. AFTER:  processed collection (e.g. SG smoothed)")
+    
+    # Extract time series from both collections
+    df_before = _extract_point_timeseries(
+        collection_before,
+        "BEFORE (original, non-smoothed)"
+    )
+    df_after = _extract_point_timeseries(
+        collection_after,
+        "AFTER (smoothed)"
+    )
+    
+    logger.info(f"\n   Before: {len(df_before)} time steps")
+    logger.info(f"   After: {len(df_after)} time steps")
+    if len(df_before) > 0 and len(df_after) > 0:
+        logger.info(f"   Date range: {df_before['date'].min()} to {df_before['date'].max()}")
+    
+    logger.info("\n💾 DataFrames ready for plotting:")
+    logger.info("   - df_before: Original values (before processing)")
+    logger.info("   - df_after:  Processed values (after processing)")
+    
+    return df_before, df_after
+
+
+def plot_sg_comparison(
+    ts_before_df: pd.DataFrame,
+    ts_after_df: pd.DataFrame,
+    bands: List[str],
+    seed: int = 42
+) -> None:
+    """
+    Plot before/after Savitzky-Golay time series comparison for a set of bands.
+    
+    This function creates side-by-side plots comparing original vs smoothed time series
+    and prints summary statistics including noise reduction metrics.
+    
+    Parameters
+    ----------
+    ts_before_df : pd.DataFrame
+        DataFrame from the original collection; must include a 'date' column and band columns.
+    ts_after_df : pd.DataFrame
+        DataFrame from the smoothed collection; same structure as ts_before_df.
+    bands : list[str]
+        Band names to compare (e.g., ['NDVI', 'EVI']).
+    seed : int, optional
+        Random seed for reproducible color assignments (default: 42).
+    
+    Returns
+    -------
+    None
+        Displays plots and prints statistics to console.
+    
+    Examples
+    --------
+    >>> bands = ['NDVI', 'EVI']
+    >>> plot_sg_comparison(ts_before_df, ts_after_df, bands)
+    """
+    if not HAS_MATPLOTLIB:
+        logger.error("matplotlib is not available. Cannot create plots.")
+        return
+    
+    bands_to_plot = bands
+    n_bands = len(bands_to_plot)
+    
+    if n_bands == 0:
+        logger.warning("⚠️  No bands supplied to plot_sg_comparison!")
+        return
+    
+    logger.info("=" * 60)
+    logger.info("Creating Savitzky-Golay comparison plots")
+    logger.info("=" * 60)
+    
+    # Generate reproducible color pairs for each band
+    np.random.seed(seed)
+    colors_info = {}
+    for band in bands_to_plot:
+        rgb_before = np.random.randint(100, 255, size=3)
+        rgb_after = (rgb_before * 0.4).astype(int)
+        colors_info[band] = {
+            'before': '#{:02x}{:02x}{:02x}'.format(*rgb_before),
+            'after': '#{:02x}{:02x}{:02x}'.format(*rgb_after)
+        }
+    
+    # Print selected color scheme
+    logger.info("🎨 Color Scheme for Visualization:")
+    logger.info("=" * 60)
+    for band, colors in colors_info.items():
+        logger.info(f"  {band}:")
+        logger.info(f"    Before SG: {colors['before']}")
+        logger.info(f"    After SG:  {colors['after']}")
+    logger.info("")
+    
+    # Create figure with one subplot per band
+    fig, axes = plt.subplots(n_bands, 1, figsize=(14, 5 * n_bands))
+    if n_bands == 1:
+        axes = [axes]
+    
+    fig.suptitle('Savitzky-Golay Filtering: Before vs After Comparison', 
+                 fontsize=16, fontweight='bold')
+    
+    for ax, band in zip(axes, bands_to_plot):
+        if band in ts_before_df.columns and band in ts_after_df.columns:
+            color_before = colors_info[band]['before']
+            color_after = colors_info[band]['after']
+            
+            ax.plot(ts_before_df['date'], ts_before_df[band],
+                   'o-', color=color_before, alpha=0.6, linewidth=1.5, markersize=4,
+                   label='Before SG (Original)', zorder=1)
+            ax.plot(ts_after_df['date'], ts_after_df[band],
+                   '-', color=color_after, linewidth=2.5,
+                   label='After SG (Smoothed)', zorder=2)
+        
+        ax.set_xlabel('Date', fontsize=12)
+        ax.set_ylabel(band, fontsize=12)
+        ax.set_title(f'{band} Time Series', fontsize=14, fontweight='bold')
+        ax.legend(loc='best', fontsize=11)
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.tick_params(axis='x', rotation=45)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Summary statistics
+    logger.info("\n📊 Summary Statistics:")
+    logger.info("=" * 60)
+    for band in bands_to_plot:
+        if band in ts_before_df.columns and band in ts_after_df.columns:
+            before_mean = ts_before_df[band].mean()
+            before_std = ts_before_df[band].std()
+            after_mean = ts_after_df[band].mean()
+            after_std = ts_after_df[band].std()
+            
+            logger.info(f"\n{band} Statistics:")
+            logger.info(f"  Before SG - Mean: {before_mean:.4f}, Std: {before_std:.4f}")
+            logger.info(f"  After SG  - Mean: {after_mean:.4f}, Std: {after_std:.4f}")
+            if before_std > 0:
+                noise_reduction = (1 - after_std / before_std) * 100
+                logger.info(f"  Noise Reduction: {noise_reduction:.1f}%")
+    
+    logger.info("=" * 60)
+
+#### INTERPOLATION SMOOTHING
+def fill_temporal_gaps_linear(collection, bands):
+    """Linearly interpolate masked pixels; fall back to nearest neighbor only at the edges."""
+    import ee
+
+    collection = collection.sort('system:time_start')
+    img_list = collection.toList(collection.size())
+
+    def augment(image, time_band):
+        image = ee.Image(image)
+        data = image.select(bands).toDouble()
+        time_value = ee.Image.constant(ee.Number(image.get('system:time_start'))).rename(time_band).toDouble()
+        time_mask = data.mask().reduce(ee.Reducer.max())
+        time_image = time_value.updateMask(time_mask)
+        combined = ee.Image(data.addBands(time_image))
+        combined = ee.Image(combined.copyProperties(image, image.propertyNames()))
+        return combined
+
+    first_forward = augment(img_list.get(0), 'time_prev')
+
+    def forward_iter(current, prev_list):
+        prev_list = ee.List(prev_list)
+        prev_img = ee.Image(prev_list.get(-1))
+        current_img = augment(current, 'time_prev')
+        filled = ee.Image(current_img.unmask(prev_img))
+        filled = ee.Image(filled.copyProperties(current_img, current_img.propertyNames()))
+        return prev_list.add(filled)
+
+    forward_list = ee.List(
+        img_list.slice(1).iterate(forward_iter, ee.List([first_forward]))
+    )
+
+    reversed_list = img_list.reverse()
+    first_backward = augment(reversed_list.get(0), 'time_next')
+
+    def backward_iter(current, prev_list):
+        prev_list = ee.List(prev_list)
+        prev_img = ee.Image(prev_list.get(-1))
+        current_img = augment(current, 'time_next')
+        filled = ee.Image(current_img.unmask(prev_img))
+        filled = ee.Image(filled.copyProperties(current_img, current_img.propertyNames()))
+        return prev_list.add(filled)
+
+    backward_list = ee.List(
+        reversed_list.slice(1).iterate(backward_iter, ee.List([first_backward]))
+    ).reverse()
+
+    def interpolate(idx, acc):
+        acc = ee.List(acc)
+        idx = ee.Number(idx)
+
+        original = ee.Image(img_list.get(idx))
+        prev_img = ee.Image(forward_list.get(idx))
+        next_img = ee.Image(backward_list.get(idx))
+
+        prev_values = prev_img.select(bands)
+        next_values = next_img.select(bands)
+        prev_time = prev_img.select('time_prev')
+        next_time = next_img.select('time_next')
+        current_time = ee.Image.constant(ee.Number(original.get('system:time_start'))).toDouble()
+
+        time_diff = next_time.subtract(prev_time)
+        interp_mask = prev_time.mask().And(next_time.mask()).And(time_diff.neq(0))
+
+        fraction = current_time.subtract(prev_time).divide(time_diff)
+        fraction = fraction.updateMask(interp_mask).clamp(0, 1)
+
+        interpolated = prev_values.add(
+            next_values.subtract(prev_values).multiply(fraction)
+        ).updateMask(interp_mask)
+
+        filled = original.select(bands)
+        filled = filled.unmask(interpolated)
+        filled = filled.unmask(prev_values)
+        filled = filled.unmask(next_values)
+
+        updated = original.addBands(filled, overwrite=True)
+        updated = ee.Image(updated.copyProperties(original, original.propertyNames()))
+        return acc.add(updated)
+
+    filled_list = ee.List(
+        ee.List.sequence(0, collection.size().subtract(1)).iterate(interpolate, ee.List([]))
+    )
+
+    return ee.ImageCollection(filled_list).sort('system:time_start')

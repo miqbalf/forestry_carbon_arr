@@ -37,7 +37,8 @@ from .gee_processing import (
     process_collection_with_indices_and_smoothing,
     remove_drops_and_spikes_gee,
     interpolate_temporal_gaps,
-    savgol_filter
+    savgol_filter,
+    fill_temporal_gaps_linear
 )
 from .tsfresh_utils import (
     standardize_to_stac_convention,

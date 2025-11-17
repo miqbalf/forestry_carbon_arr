@@ -615,9 +615,11 @@ def prepare_tsfresh_data_with_ground_truth(
         else:
             gt = gt.expand_dims(plot_id=[layer_name])
         
-        # 8. Create validity masks (lazy)
-        gt['gt_valid'] = gt['ground_truth'].notnull().all(dim='time')
-        gt['gt_valid'].attrs['description'] = 'Pixels with labels for all times (per plot)'
+        # 8. Create validity masks
+        #    Keep the full (plot_id, time, y, x) structure so that downstream
+        #    processing can choose how to aggregate over time (e.g. .all(dim="time")).
+        gt['gt_valid'] = gt['ground_truth'].notnull()
+        gt['gt_valid'].attrs['description'] = 'Pixels with labels (per plot and time step)'
         
         # 9. Merge with clipped satellite data
         logger.info("  Merging satellite data with ground truth...")
