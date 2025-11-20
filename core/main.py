@@ -513,6 +513,16 @@ class ForestryCarbonARR:
                         config['I_satellite'] = config['satellite']['provider']
                         self.logger.info("Extracted I_satellite from satellite.provider")
             
+            # Extract FCD threshold keys from nested structure (fcd.thresholds.*)
+            # These are required by AssignClassZone
+            fcd_threshold_keys = ['open_land', 'shrub_grass', 'yrf_forest', 'high_forest']
+            if 'fcd' in config and isinstance(config['fcd'], dict):
+                if 'thresholds' in config['fcd'] and isinstance(config['fcd']['thresholds'], dict):
+                    for key in fcd_threshold_keys:
+                        if key not in config and key in config['fcd']['thresholds']:
+                            config[key] = config['fcd']['thresholds'][key]
+                            self.logger.info(f"Extracted {key} from fcd.thresholds.{key}")
+            
             # Validate required config keys
             required_keys = ['AOI_path', 'input_training', 'OID_field_name', 'date_start_end']
             missing_keys = [key for key in required_keys if key not in config]
@@ -838,20 +848,39 @@ class ForestryCarbonARR:
             
             # Step 8: OBIA Segmentation
             self.logger.info("Performing OBIA segmentation...")
+            # Follow the exact same process as reference implementation
+            # obia = OBIASegmentation(config=config, image=image_norm_with_spectral_indices_FCD, pca_scale=pca_scale)
             obia = OBIASegmentation(
                 config=config,
                 image=image_norm_with_spectral_indices_FCD,
                 pca_scale=pca_scale
             )
             
+            # clusters = obia.SNIC_cluster()['clusters']
             clusters = obia.SNIC_cluster()['clusters']
+            
+            # object_properties_image = obia.summarize_cluster(is_include_std = False)
             object_properties_image = obia.summarize_cluster(is_include_std=False)
+            
+            # make sure has all the same type of data in all bands, for exporting purpose
+            # object_properties_image = object_properties_image.clip(AOI).toFloat()
             object_properties_image = object_properties_image.clip(AOI).toFloat()
             
+            # Add clusters band as integer (required for reduceConnectedComponents in object-based classification)
+            # This is added AFTER toFloat() to keep clusters as integer for proper object-based classification
+            clusters_int = clusters.select('clusters').toInt().rename('clusters')
+            object_properties_image = object_properties_image.addBands(clusters_int)
+            
             # Step 9: Add date analyzed to config
+            # config["date_analyzed"] = datetime.now().strftime("%Y-%m-%d")
             config["date_analyzed"] = datetime.now().strftime("%Y-%m-%d")
             
             # Step 10: ML Classification using existing training points
+            # lc = LandcoverML(config=config,
+            #                  input_image = image_norm_with_spectral_indices_FCD,
+            #                 cluster_properties=object_properties_image,
+            #                  num_class=5, # make sure this one is align with total type landcover stratification, for a sample creation, but not for using the existing input training
+            #                 pca_scale = pca_scale)
             self.logger.info("Running ML classification...")
             lc = LandcoverML(
                 config=config,
@@ -1056,6 +1085,7 @@ class ForestryCarbonARR:
                 'ml_training_points': ml_training_points,  # Actual training points used by ML classifier (after split)
                 'ml_validation_points': ml_validation_points,  # Actual validation points for confusion matrix (after split)
                 'classifier_results': classifier,  # Full ML classifier results
+                'landcover_ml_instance': lc,  # LandcoverML instance for accuracy assessment
                 'selected_image_lc': selected_image_lc,
                 'algo_ml_selected': algo_ml_selected,
                 'hansen_results': run_hansen,  # Contains treeLossYear, treeLoss, minLoss, gfc, etc.
@@ -1067,6 +1097,14 @@ class ForestryCarbonARR:
                 'zones_all_algorithms': zones_all_algorithms,  # Zone classifications for all ML algorithms (rf, svm, gbm, cart)
                 'HighForestDense': HighForestDense,
                 'layer_names': layer_names  # Standardized layer names for visualization/export
+            }
+            
+            # Store results in instance for later access
+            self._last_eligibility_results = {
+                'final_zone': final_zone,
+                'intermediate_results': intermediate_results,
+                'visualization_params': visualization_params,
+                'config': config
             }
             
             self.logger.info("Forestry ARR Eligibility analysis workflow completed successfully!")
@@ -1081,6 +1119,179 @@ class ForestryCarbonARR:
         except Exception as e:
             self.logger.error(f"Workflow failed: {e}", exc_info=True)
             raise ForestryCarbonError(f"Forestry ARR Eligibility analysis failed: {e}")
+    
+    def assess_accuracy(self,
+                      eligibility_results: Optional[Dict[str, Any]] = None,
+                      validation_points: Optional['ee.FeatureCollection'] = None,
+                      output_dir: Optional[str] = None,
+                      algorithms: Optional[List[str]] = None,
+                      label_column: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Assess accuracy of classification results using confusion matrices.
+        
+        This method generates confusion matrices and accuracy metrics for:
+        - FCD-based land cover classification
+        - ML classifier results (RF, SVM, GBM, CART)
+        
+        Args:
+            eligibility_results: Results dictionary from run_eligibility().
+                                 If None, uses the last run_eligibility results.
+            validation_points: Validation points (ee.FeatureCollection).
+                              If None, uses validation points from eligibility_results.
+            output_dir: Output directory for saving confusion matrix results.
+                       If None, uses config['output']['output_directory'].
+            algorithms: List of algorithms to assess. Options: ['fcd', 'rf', 'svm', 'gbm', 'cart'].
+                       If None, assesses all algorithms.
+            label_column: Label column name in validation points. If None, uses config['label_column'].
+        
+        Returns:
+            Dictionary containing confusion matrix results for each algorithm:
+            {
+                'fcd': confusion_matrix_dict,
+                'rf': confusion_matrix_dict,
+                'svm': confusion_matrix_dict,
+                'gbm': confusion_matrix_dict,
+                'cart': confusion_matrix_dict
+            }
+        
+        Example:
+            >>> # After running run_eligibility
+            >>> el = forestry.run_eligibility(config=forestry.config, use_gee=True)
+            >>> 
+            >>> # Assess accuracy for all algorithms
+            >>> accuracy_results = forestry.assess_accuracy(
+            ...     eligibility_results=el,
+            ...     output_dir='./outputs'
+            ... )
+            >>> 
+            >>> # Or assess only specific algorithms
+            >>> accuracy_results = forestry.assess_accuracy(
+            ...     eligibility_results=el,
+            ...     algorithms=['fcd', 'gbm'],
+            ...     output_dir='./outputs'
+            ... )
+        """
+        import os
+        from pathlib import Path
+        from typing import Dict, Any, Optional, List
+        
+        # Get eligibility results
+        if eligibility_results is None:
+            if hasattr(self, '_last_eligibility_results') and self._last_eligibility_results is not None:
+                eligibility_results = self._last_eligibility_results
+                self.logger.info("Using last run_eligibility results")
+            else:
+                raise ForestryCarbonError(
+                    "No eligibility results provided. Either pass eligibility_results parameter "
+                    "or run run_eligibility() first."
+                )
+        
+        intermediate_results = eligibility_results.get('intermediate_results', {})
+        config = eligibility_results.get('config', self.config)
+        
+        # Get LandcoverML instance
+        lc = intermediate_results.get('landcover_ml_instance')
+        if lc is None:
+            raise ForestryCarbonError(
+                "LandcoverML instance not found in eligibility results. "
+                "This method requires results from run_eligibility()."
+            )
+        
+        # Get validation points
+        if validation_points is None:
+            validation_points = intermediate_results.get('ml_validation_points')
+            if validation_points is None:
+                raise ForestryCarbonError(
+                    "Validation points not found. Either provide validation_points parameter "
+                    "or ensure run_eligibility() generated validation points."
+                )
+        
+        # Get label column
+        if label_column is None:
+            label_column = config.get('label_column', 'code_lu')
+        
+        # Get output directory
+        if output_dir is None:
+            output_dir = config.get('output', {}).get('output_directory', './outputs')
+        
+        # Create output directory if it doesn't exist
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = str(output_dir)
+        
+        # Default algorithms to assess
+        if algorithms is None:
+            algorithms = ['fcd', 'rf', 'svm', 'gbm', 'cart']
+        
+        # Validate algorithms
+        valid_algorithms = ['fcd', 'rf', 'svm', 'gbm', 'cart']
+        invalid_algorithms = [alg for alg in algorithms if alg not in valid_algorithms]
+        if invalid_algorithms:
+            raise ForestryCarbonError(
+                f"Invalid algorithms: {invalid_algorithms}. Valid options: {valid_algorithms}"
+            )
+        
+        self.logger.info(f"Assessing accuracy for algorithms: {algorithms}")
+        
+        # Get classifier results
+        classifier_results = intermediate_results.get('classifier_results', {})
+        list_images_classified = intermediate_results.get('list_images_classified', {})
+        
+        # Dictionary to store results
+        accuracy_results = {}
+        
+        # Assess FCD-based classification
+        if 'fcd' in algorithms:
+            self.logger.info("Assessing FCD-based land cover classification accuracy...")
+            fcd_class_lc_image = list_images_classified.get('fcd_class_lc_image')
+            if fcd_class_lc_image is None:
+                self.logger.warning("FCD land cover image not found, skipping FCD accuracy assessment")
+            else:
+                try:
+                    fcd_matrix = lc.matrix_confusion(
+                        image_class=fcd_class_lc_image,
+                        validation_points=validation_points,
+                        ml_algorithm='fcd',
+                        output_dir=output_dir,
+                        label_column=label_column
+                    )
+                    accuracy_results['fcd'] = fcd_matrix
+                except Exception as e:
+                    self.logger.error(f"Error assessing FCD accuracy: {e}", exc_info=True)
+                    accuracy_results['fcd'] = None
+        
+        # Assess ML classifier results
+        ml_algorithms = {
+            'rf': classifier_results.get('classified_image_rf'),
+            'svm': classifier_results.get('classified_image_svm'),
+            'gbm': classifier_results.get('classified_image_gbm'),
+            'cart': classifier_results.get('classified_image_cart')
+        }
+        
+        for alg_name in ['rf', 'svm', 'gbm', 'cart']:
+            if alg_name in algorithms:
+                self.logger.info(f"Assessing {alg_name.upper()} classification accuracy...")
+                classified_image = ml_algorithms.get(alg_name)
+                if classified_image is None:
+                    self.logger.warning(f"{alg_name.upper()} classified image not found, skipping accuracy assessment")
+                    accuracy_results[alg_name] = None
+                else:
+                    try:
+                        matrix = lc.matrix_confusion(
+                            image_class=classified_image,
+                            validation_points=validation_points,
+                            ml_algorithm=alg_name,
+                            output_dir=output_dir,
+                            label_column=label_column
+                        )
+                        accuracy_results[alg_name] = matrix
+                    except Exception as e:
+                        self.logger.error(f"Error assessing {alg_name.upper()} accuracy: {e}", exc_info=True)
+                        accuracy_results[alg_name] = None
+        
+        self.logger.info("Accuracy assessment completed!")
+        
+        return accuracy_results
     
     def get_ds_resampled_gee(self,
                              config: Optional[Dict[str, Any]] = None,
@@ -2246,6 +2457,93 @@ class ForestryCarbonARR:
             storage=storage,
             overwrite=overwrite
         )
+    
+    @staticmethod
+    def calculate_super_pixel_size(
+        mmu_hectares: float,
+        pixel_resolution_meters: float,
+        safety_factor: float = 1.1
+    ) -> int:
+        """
+        Calculate the required super pixel size for a given Minimum Mapping Unit (MMU).
+        
+        The super pixel size ensures that each superpixel from SNIC segmentation
+        meets or exceeds the MMU requirement.
+        
+        Formula:
+            super_pixel_size ≥ √(MMU_m²) / pixel_resolution
+            where MMU_m² = MMU_hectares × 10,000
+        
+        Args:
+            mmu_hectares: Minimum Mapping Unit in hectares (e.g., 0.25 for 0.25 ha)
+            pixel_resolution_meters: Pixel resolution in meters (e.g., 5 for Planet, 10 for Sentinel, 30 for Landsat)
+            safety_factor: Safety factor to ensure superpixels are slightly larger than MMU (default: 1.1 = 10% larger)
+        
+        Returns:
+            Recommended super pixel size (integer, rounded up)
+        
+        Examples:
+            >>> # For 0.25 ha MMU with Planet (5m resolution)
+            >>> ForestryCarbonARR.calculate_super_pixel_size(0.25, 5)
+            11
+            
+            >>> # For 0.25 ha MMU with Sentinel (10m resolution)
+            >>> ForestryCarbonARR.calculate_super_pixel_size(0.25, 10)
+            6
+            
+            >>> # For 0.25 ha MMU with Landsat (30m resolution)
+            >>> ForestryCarbonARR.calculate_super_pixel_size(0.25, 30)
+            2
+        """
+        import math
+        
+        # Convert MMU from hectares to square meters
+        mmu_square_meters = mmu_hectares * 10000
+        
+        # Calculate minimum super pixel size
+        # Area per superpixel = super_pixel_size² × pixel_resolution²
+        # We need: super_pixel_size² × pixel_resolution² ≥ mmu_square_meters
+        # Therefore: super_pixel_size ≥ √(mmu_square_meters) / pixel_resolution
+        min_super_pixel_size = math.sqrt(mmu_square_meters) / pixel_resolution_meters
+        
+        # Apply safety factor and round up to nearest integer
+        recommended_size = math.ceil(min_super_pixel_size * safety_factor)
+        
+        # Ensure minimum size is at least 2 (SNIC typically needs at least 2)
+        return max(2, recommended_size)
+    
+    @staticmethod
+    def calculate_super_pixel_area(
+        super_pixel_size: int,
+        pixel_resolution_meters: float
+    ) -> Dict[str, float]:
+        """
+        Calculate the area covered by a super pixel.
+        
+        Args:
+            super_pixel_size: Size of super pixel (e.g., 5, 10, 277)
+            pixel_resolution_meters: Pixel resolution in meters
+        
+        Returns:
+            Dictionary with:
+                - 'area_m2': Area in square meters
+                - 'area_hectares': Area in hectares
+                - 'area_acres': Area in acres (for reference)
+        
+        Examples:
+            >>> ForestryCarbonARR.calculate_super_pixel_area(10, 5)
+            {'area_m2': 2500.0, 'area_hectares': 0.25, 'area_acres': 0.6178...}
+        """
+        # Area = super_pixel_size² × pixel_resolution²
+        area_m2 = (super_pixel_size ** 2) * (pixel_resolution_meters ** 2)
+        area_hectares = area_m2 / 10000
+        area_acres = area_m2 / 4046.86  # 1 acre = 4046.86 m²
+        
+        return {
+            'area_m2': round(area_m2, 2),
+            'area_hectares': round(area_hectares, 4),
+            'area_acres': round(area_acres, 4)
+        }
     
     def __repr__(self) -> str:
         return f"ForestryCarbonARR(gee_forestry_available={self._gee_forestry_available}, strategy={self._import_strategy})"

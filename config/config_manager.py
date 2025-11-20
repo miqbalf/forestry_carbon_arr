@@ -208,6 +208,15 @@ class ConfigManager:
                 if 'provider' in config_copy['satellite']:
                     config_copy['I_satellite'] = config_copy['satellite']['provider']
         
+        # Extract FCD threshold keys from nested structure (fcd.thresholds.*)
+        # These are required by AssignClassZone and other legacy code
+        fcd_threshold_keys = ['open_land', 'shrub_grass', 'yrf_forest', 'high_forest']
+        if 'fcd' in config_copy and isinstance(config_copy['fcd'], dict):
+            if 'thresholds' in config_copy['fcd'] and isinstance(config_copy['fcd']['thresholds'], dict):
+                for key in fcd_threshold_keys:
+                    if key not in config_copy and key in config_copy['fcd']['thresholds']:
+                        config_copy[key] = config_copy['fcd']['thresholds'][key]
+        
         return config_copy
     
     def get(self, key: str, default: Any = None) -> Any:
