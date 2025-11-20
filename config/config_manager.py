@@ -130,10 +130,14 @@ class ConfigManager:
             if key not in flat_keys_to_remove:
                 normalized[key] = value
         
-        # For backward compatibility, also add I_satellite to flat dict
-        # even though it's mapped to satellite.provider
+        # For backward compatibility, also add flat keys to the dict
+        # even though they're mapped to nested structure
         if 'I_satellite' in flat_config:
             normalized['I_satellite'] = flat_config['I_satellite']
+        
+        # Also preserve date_start_end for backward compatibility
+        if 'date_start_end' in flat_config:
+            normalized['date_start_end'] = flat_config['date_start_end']
         
         return normalized
     
@@ -190,7 +194,21 @@ class ConfigManager:
         external libraries may depend on the flat structure.
         """
         # Return a copy to prevent accidental modification
-        return self._config.copy()
+        config_copy = self._config.copy()
+        
+        # Ensure backward compatibility: add flat keys from nested structure
+        # if they don't already exist
+        if 'date_start_end' not in config_copy:
+            if 'satellite' in config_copy and isinstance(config_copy['satellite'], dict):
+                if 'date_range' in config_copy['satellite']:
+                    config_copy['date_start_end'] = config_copy['satellite']['date_range']
+        
+        if 'I_satellite' not in config_copy:
+            if 'satellite' in config_copy and isinstance(config_copy['satellite'], dict):
+                if 'provider' in config_copy['satellite']:
+                    config_copy['I_satellite'] = config_copy['satellite']['provider']
+        
+        return config_copy
     
     def get(self, key: str, default: Any = None) -> Any:
         """

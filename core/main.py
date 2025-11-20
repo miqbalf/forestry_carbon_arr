@@ -259,6 +259,120 @@ class ForestryCarbonARR:
         except ImportError:
             raise ForestryCarbonError("Earth Engine library not available. Install with: pip install earthengine-api geemap")
     
+    def _detect_satellite_type_from_bands(self, image) -> str:
+        """
+        Detect satellite type from available bands and resolution in a custom image.
+        
+        Detection logic:
+        - Sentinel: Has swir1 and swir2, resolution ~10m
+        - Landsat: Has swir1 and swir2, resolution >10m (typically 30m)
+        - Planet: Has red, green, blue, nir but no swir1/swir2, resolution ~3-5m
+        
+        Args:
+            image: Earth Engine Image to analyze
+            
+        Returns:
+            Detected satellite type: 'Sentinel', 'Landsat', or 'Planet'
+        """
+        try:
+            import ee
+            available_bands = image.bandNames().getInfo()
+            available_bands_lower = [b.lower() for b in available_bands]
+            
+            # Check for required basic bands
+            has_red = any('red' in b for b in available_bands_lower)
+            has_green = any('green' in b for b in available_bands_lower)
+            has_blue = any('blue' in b for b in available_bands_lower)
+            has_nir = any('nir' in b for b in available_bands_lower)
+            
+            if not (has_red and has_green and has_blue and has_nir):
+                self.logger.warning(
+                    f"Image missing basic RGB/NIR bands. Available: {available_bands}. "
+                    f"Defaulting to Planet."
+                )
+                return 'Planet'
+            
+            # Check for SWIR bands (Sentinel/Landsat characteristic)
+            has_swir1 = any('swir1' in b for b in available_bands_lower)
+            has_swir2 = any('swir2' in b for b in available_bands_lower)
+            
+            if has_swir1 and has_swir2:
+                # Has both SWIR bands - could be Sentinel or Landsat
+                # Check resolution to distinguish: Sentinel ~10m, Landsat ~30m
+                try:
+                    # Get resolution from first band's projection
+                    first_band = image.select(0)
+                    resolution = first_band.projection().nominalScale().getInfo()
+                    
+                    # Sentinel-2: ~10m resolution
+                    # Landsat: ~30m resolution
+                    if resolution is not None:
+                        if resolution > 15:  # >15m suggests Landsat (30m)
+                            self.logger.info(
+                                f"Detected Landsat-like image (has swir1/swir2, resolution={resolution:.1f}m). "
+                                f"Using Landsat formulas. Available bands: {available_bands}"
+                            )
+                            return 'Landsat'
+                        else:  # <=15m suggests Sentinel (10m)
+                            self.logger.info(
+                                f"Detected Sentinel-like image (has swir1/swir2, resolution={resolution:.1f}m). "
+                                f"Using Sentinel formulas. Available bands: {available_bands}"
+                            )
+                            return 'Sentinel'
+                    else:
+                        # Resolution not available, default to Sentinel (more common)
+                        self.logger.info(
+                            f"Detected Sentinel/Landsat-like image (has swir1 and swir2, resolution unknown). "
+                            f"Using Sentinel formulas. Available bands: {available_bands}"
+                        )
+                        return 'Sentinel'
+                except Exception as res_error:
+                    # If resolution check fails, default to Sentinel
+                    self.logger.warning(
+                        f"Could not check resolution: {res_error}. "
+                        f"Defaulting to Sentinel for swir1/swir2 image."
+                    )
+                    return 'Sentinel'
+            elif has_swir1:
+                # Has swir1 but not swir2 - check resolution
+                try:
+                    first_band = image.select(0)
+                    resolution = first_band.projection().nominalScale().getInfo()
+                    
+                    if resolution is not None and resolution > 15:
+                        self.logger.info(
+                            f"Detected Landsat-like image (has swir1, resolution={resolution:.1f}m). "
+                            f"Using Landsat formulas. Available bands: {available_bands}"
+                        )
+                        return 'Landsat'
+                    else:
+                        self.logger.info(
+                            f"Detected Sentinel-like image (has swir1, resolution={resolution:.1f}m if available). "
+                            f"Using Sentinel formulas. Available bands: {available_bands}"
+                        )
+                        return 'Sentinel'
+                except Exception:
+                    # Default to Sentinel if resolution check fails
+                    self.logger.info(
+                        f"Detected Sentinel-like image (has swir1 but no swir2). "
+                        f"Using Sentinel formulas. Available bands: {available_bands}"
+                    )
+                    return 'Sentinel'
+            else:
+                # No SWIR bands - Planet-like
+                self.logger.info(
+                    f"Detected Planet-like image (RGB+NIR, no SWIR). "
+                    f"Using Planet formulas. Available bands: {available_bands}"
+                )
+                return 'Planet'
+                
+        except Exception as e:
+            self.logger.warning(
+                f"Could not detect satellite type from bands: {e}. "
+                f"Defaulting to Planet (safest for custom images)."
+            )
+            return 'Planet'
+    
     def run_eligibility(self, 
                         config: Dict[str, Any],
                         use_gee: bool = True,
@@ -283,7 +397,9 @@ class ForestryCarbonARR:
                 - AOI_path: Path to AOI shapefile
                 - input_training: Path to training points shapefile
                 - OID_field_name: Field name for AOI ID
-                - I_satellite: Satellite type ('Sentinel', 'Landsat', 'Planet')
+                - label_column: Field name for class labels in training points (default: 'code_lu')
+                - I_satellite: Satellite type ('Sentinel', 'Landsat', 'Planet', 'Custom')
+                    If 'Custom', must provide custom_image in kwargs
                 - date_start_end: [start_date, end_date]
                 - project_name: Project name
                 - cloud_cover_threshold: Cloud cover threshold
@@ -307,6 +423,11 @@ class ForestryCarbonARR:
             use_gee: Whether to use Google Earth Engine (True) or STAC (False)
                 Currently only use_gee=True is implemented. use_gee=False returns None.
             **kwargs: Additional keyword arguments
+                - custom_image: ee.Image, optional
+                    Custom Earth Engine Image to use instead of creating ImageCollection.
+                    Required if I_satellite='Custom'. The image should have bands named:
+                    'red', 'green', 'blue', 'nir' (and optionally 'swir1', 'swir2' for Planet).
+                    Example: custom_image=input_image_fix (from notebook)
             
         Returns:
             Dictionary containing:
@@ -374,6 +495,32 @@ class ForestryCarbonARR:
             # Ensure config is a dict and has required parameters with defaults
             if not isinstance(config, dict):
                 raise ForestryCarbonError("config must be a dictionary")
+            
+            # Normalize config: handle nested structure from ConfigManager
+            # ConfigManager may store date_start_end as satellite.date_range
+            # For backward compatibility, extract flat keys from nested structure
+            if 'date_start_end' not in config:
+                # Try to get from nested structure (satellite.date_range)
+                if 'satellite' in config and isinstance(config['satellite'], dict):
+                    if 'date_range' in config['satellite']:
+                        config['date_start_end'] = config['satellite']['date_range']
+                        self.logger.info("Extracted date_start_end from satellite.date_range")
+            
+            # Also handle I_satellite from nested structure
+            if 'I_satellite' not in config:
+                if 'satellite' in config and isinstance(config['satellite'], dict):
+                    if 'provider' in config['satellite']:
+                        config['I_satellite'] = config['satellite']['provider']
+                        self.logger.info("Extracted I_satellite from satellite.provider")
+            
+            # Validate required config keys
+            required_keys = ['AOI_path', 'input_training', 'OID_field_name', 'date_start_end']
+            missing_keys = [key for key in required_keys if key not in config]
+            if missing_keys:
+                raise ForestryCarbonError(
+                    f"Missing required config keys: {missing_keys}. "
+                    f"Available keys: {list(config.keys())}"
+                )
             
             # Set default values for optional parameters
             config.setdefault('IsThermal', False)
@@ -454,20 +601,67 @@ class ForestryCarbonARR:
             # Step 3: Load and validate training points
             self.logger.info("Loading training points...")
             training_path = config['input_training']
-            if not os.path.exists(training_path):
-                raise ForestryCarbonError(f"Training points file not found: {training_path}")
             
-            training_points_gdf = gpd.GeoDataFrame.from_file(training_path)
+            # Check if path exists (handle both local and GCS paths)
+            is_gcs_path = training_path.startswith('gs://')
+            if is_gcs_path:
+                # For GCS paths, check using gcsfs
+                try:
+                    import gcsfs
+                    project = os.getenv('GOOGLE_CLOUD_PROJECT')
+                    if not project:
+                        raise ForestryCarbonError(
+                            "GOOGLE_CLOUD_PROJECT environment variable not set. "
+                            "Required for GCS operations."
+                        )
+                    
+                    # Create filesystem with token support (same pattern as zarr_utils)
+                    token_path = os.getenv("GCS_TOKEN_PATH", "/usr/src/app/user_id.json")
+                    fs_kwargs = {"project": project}
+                    if token_path and os.path.exists(token_path):
+                        fs_kwargs["token"] = token_path
+                    
+                    fs = gcsfs.GCSFileSystem(**fs_kwargs)
+                    
+                    if not fs.exists(training_path):
+                        raise ForestryCarbonError(f"Training points file not found on GCS: {training_path}")
+                    
+                    self.logger.info(f"Loading training points from GCS: {training_path}")
+                    # Read shapefile from GCS using filesystem parameter
+                    training_points_gdf = gpd.read_file(training_path, filesystem=fs)
+                except ImportError:
+                    raise ForestryCarbonError(
+                        "gcsfs is required for GCS paths. Install with: pip install gcsfs"
+                    )
+                except Exception as e:
+                    raise ForestryCarbonError(f"Could not load training points from GCS: {e}")
+            else:
+                # For local paths, use standard file check
+                if not os.path.exists(training_path):
+                    raise ForestryCarbonError(f"Training points file not found: {training_path}")
+                self.logger.info(f"Loading training points from local: {training_path}")
+                training_points_gdf = gpd.GeoDataFrame.from_file(training_path)
             
             # Check CRS
             if training_points_gdf.crs != config['crs_input']:
                 training_points_gdf = training_points_gdf.to_crs(config['crs_input'])
             
-            # Validate training points - filter non-integer code_lu values
+            # Get label column from config (default to 'code_lu' for backward compatibility)
+            label_column = config.get('label_column', 'code_lu')
+            self.logger.info(f"Using label column: {label_column}")
+            
+            # Validate label column exists in training points
+            if label_column not in training_points_gdf.columns:
+                raise ForestryCarbonError(
+                    f"Label column '{label_column}' not found in training points. "
+                    f"Available columns: {list(training_points_gdf.columns)}"
+                )
+            
+            # Validate training points - filter non-integer label values
             def is_integer(value):
                 return isinstance(value, int)
             
-            training_points_gdf['code_lu'] = training_points_gdf['code_lu'].apply(
+            training_points_gdf[label_column] = training_points_gdf[label_column].apply(
                 lambda x: x if is_integer(x) else None
             )
             
@@ -477,8 +671,9 @@ class ForestryCarbonARR:
             training_points_info = {
                 'training_points_ee': training_points_ee,  # Earth Engine FeatureCollection
                 'num_points_before_validation': training_points_gdf.shape[0],
-                'num_points_after_validation': training_points_gdf['code_lu'].notna().sum(),
-                'unique_classes': sorted(training_points_gdf['code_lu'].dropna().unique().tolist()) if 'code_lu' in training_points_gdf.columns else []
+                'num_points_after_validation': training_points_gdf[label_column].notna().sum(),
+                'unique_classes': sorted(training_points_gdf[label_column].dropna().unique().tolist()) if label_column in training_points_gdf.columns else [],
+                'label_column': label_column  # Store the label column name used
             }
             
             # Step 4 & 5: Calculate FCD (FCDCalc creates ImageCollection internally and optimizes calls)
@@ -488,9 +683,46 @@ class ForestryCarbonARR:
             if 'IsThermal' not in config:
                 config['IsThermal'] = False
             
-            # FCDCalc creates its own ImageCollection and computes image_mosaick once
-            # This now only prints "selecting Sentinel images" once (from image_mosaick() in __init__)
-            fcd_instance = FCDCalc(config)
+            # Check if custom image is provided (for I_satellite='Custom' or custom_image in kwargs)
+            custom_image = kwargs.get('custom_image', None)
+            is_custom_satellite = config.get('I_satellite', '').lower() == 'custom'
+            use_custom_image = is_custom_satellite or (custom_image is not None)
+            detected_satellite = None  # Will be set only if I_satellite='Custom'
+            
+            if use_custom_image:
+                # Use custom image directly, skip ImageCollection creation
+                if custom_image is None:
+                    raise ForestryCarbonError(
+                        "I_satellite='Custom' requires custom_image parameter in kwargs, "
+                        "or provide custom_image directly in kwargs"
+                    )
+                self.logger.info("Using custom image provided in kwargs...")
+                image_mosaick = custom_image.clip(AOI)
+                
+                # Only detect satellite type if I_satellite is explicitly set to 'Custom'
+                # If user specified 'Sentinel', 'Landsat', or 'Planet', respect that choice
+                if is_custom_satellite:
+                    # For Custom images, detect satellite type from available bands and resolution
+                    # This allows handling different custom image types dynamically
+                    detected_satellite = self._detect_satellite_type_from_bands(image_mosaick)
+                    self.logger.info(f"Detected satellite type for Custom image: {detected_satellite}")
+                    
+                    # Create a temporary config for FCDCalc that maps 'Custom' to detected satellite type
+                    fcd_config = config.copy()
+                    fcd_config['I_satellite'] = detected_satellite
+                else:
+                    # User specified a satellite type explicitly (Sentinel/Landsat/Planet)
+                    # Use the specified type, don't override with detection
+                    fcd_config = config.copy()
+                    self.logger.info(f"Using explicitly specified satellite type: {config.get('I_satellite')}")
+                
+                # Pass image_mosaick directly to FCDCalc with config
+                fcd_instance = FCDCalc(fcd_config, image_mosaick=image_mosaick)
+            else:
+                # FCDCalc creates its own ImageCollection and computes image_mosaick once
+                # This now only prints "selecting Sentinel images" once (from image_mosaick() in __init__)
+                fcd_instance = FCDCalc(config)
+            
             class_FCD_run = fcd_instance.fcd_calc()
             # Select the 'FCD' band explicitly for visualization (FCD images have single 'FCD' band)
             # FCD values can be negative or > 80, so clamp to 0-80 range for proper color visualization
@@ -503,7 +735,15 @@ class ForestryCarbonARR:
             
             # Step 6: Calculate spectral indices
             self.logger.info("Calculating spectral indices...")
-            classImageSpectral = SpectralAnalysis(image_mosaick, config)
+            # Use the same satellite type mapping for spectral analysis as we did for FCD
+            spectral_config = config.copy()
+            if use_custom_image and is_custom_satellite:
+                # Only override if I_satellite was 'Custom' and we detected a type
+                # If user explicitly specified Sentinel/Landsat/Planet, respect that
+                if detected_satellite is not None:
+                    spectral_config['I_satellite'] = detected_satellite
+            
+            classImageSpectral = SpectralAnalysis(image_mosaick, spectral_config)
             pca_scale = classImageSpectral.pca_scale
             
             ndwi_image = classImageSpectral.NDWI_func()
@@ -620,7 +860,13 @@ class ForestryCarbonARR:
                 pca_scale=pca_scale
             )
             
-            classifier = lc.run_classifier()
+            # Pass the already-loaded training points directly as Earth Engine FeatureCollection
+            # This avoids reloading from GCS path which can fail
+            lc.input_training = training_points_ee
+            
+            # Pass label_column from config to run_classifier
+            # Set ee_training_input=True since we're passing FeatureCollection directly
+            classifier = lc.run_classifier(label_column=label_column, ee_training_input=True)
             
             # Extract actual training and validation points used for ML (after split/stratification)
             # These are the points used for training the classifier and generating confusion matrix
@@ -649,6 +895,36 @@ class ForestryCarbonARR:
             
             # Step 11: Hansen Historical Loss Analysis
             self.logger.info("Analyzing Hansen historical tree loss...")
+            
+            # Ensure date_start_end is in config (required by HansenHistorical)
+            # The config should have date_start_end from the JSON file
+            if 'date_start_end' not in config:
+                # Try to get from self.config as fallback (in case config param is a copy)
+                if hasattr(self, 'config') and 'date_start_end' in self.config:
+                    self.logger.warning("date_start_end not in passed config, using self.config")
+                    config['date_start_end'] = self.config['date_start_end']
+                else:
+                    # Log available keys for debugging
+                    self.logger.error(f"Config keys available: {list(config.keys())}")
+                    if hasattr(self, 'config'):
+                        self.logger.error(f"self.config keys: {list(self.config.keys())}")
+                    raise ForestryCarbonError(
+                        "date_start_end is required in config for Hansen historical loss analysis. "
+                        f"Current config keys: {list(config.keys())}"
+                    )
+            
+            # Log date_start_end for debugging
+            self.logger.info(f"Using date_start_end: {config['date_start_end']}")
+            
+            # Ensure all required keys for HansenHistorical are present
+            hansen_required_keys = ['pixel_number', 'year_start_loss', 'tree_cover_forest', 'AOI', 'date_start_end']
+            missing_hansen_keys = [key for key in hansen_required_keys if key not in config]
+            if missing_hansen_keys:
+                raise ForestryCarbonError(
+                    f"Missing required config keys for Hansen analysis: {missing_hansen_keys}. "
+                    f"Available keys: {list(config.keys())}"
+                )
+            
             hansen_class = HansenHistorical(config)
             run_hansen = hansen_class.initiate_tcl()
             
