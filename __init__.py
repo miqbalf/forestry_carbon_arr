@@ -16,10 +16,23 @@ from .core import ForestryCarbonARR
 from .config import ConfigManager
 from .exceptions import ForestryCarbonError, DependencyError
 
+# Planet integration
+try:
+    from .planet_api import PlanetScopeDownloader, PlanetScopeWorkflow
+    PLANET_AVAILABLE = True
+except ImportError:
+    PLANET_AVAILABLE = False
+    PlanetScopeDownloader = None
+    PlanetScopeWorkflow = None
+
 # Export main classes
 __all__ = [
     'ForestryCarbonARR',
     'ConfigManager',
     'ForestryCarbonError',
-    'DependencyError'
+    'DependencyError',
 ]
+
+# Conditionally export Planet classes
+if PLANET_AVAILABLE:
+    __all__.extend(['PlanetScopeDownloader', 'PlanetScopeWorkflow'])

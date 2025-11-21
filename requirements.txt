@@ -18,5 +18,10 @@ python-dotenv>=1.0.0
 click>=8.1.0
 tqdm>=4.66.0
 
+# Planet API integration
+planet>=3.4.0
+gcsfs>=2023.1.0
+folium>=0.15.0
+
 # Optional dependencies (install with extras)
 # GEE: pip install forestry_carbon_arr[gee]
