@@ -29,7 +29,6 @@ class PlanetScopeDownloader:
         Args:
             api_key: Planet API key. If None, reads from PLANET_API_KEY env var.
         """
-        # Use PLANET_API_KEY as primary reference
         self.api_key = api_key or os.getenv('PLANET_API_KEY')
         if not self.api_key:
             raise ValueError(
@@ -37,12 +36,8 @@ class PlanetScopeDownloader:
                 "or pass api_key parameter."
             )
         
-        # Set PLANET_API_KEY as primary
+        # Set API key as environment variable (required by SDK v3.4.0)
         os.environ['PLANET_API_KEY'] = self.api_key
-        
-        # If Planet SDK expects PL_API_KEY, set it from PLANET_API_KEY
-        if not os.getenv('PL_API_KEY'):
-            os.environ['PL_API_KEY'] = self.api_key
         
     def search_images(
         self,
@@ -344,12 +339,9 @@ class PlanetScopeDownloader:
         print(f"   Items: {len(item_ids)}")
         print(f"   Bundle type: {bundle_type}")
         
-        # Build order request according to Planet Orders API documentation:
-        # https://docs.planet.com/develop/apis/orders/mechanics/
-        # Required: name, source_type, products
+        # Build order request
         order_request = {
             "name": order_name,
-            "source_type": "scenes",  # Required: "scenes" for PSScene items
             "products": [
                 {
                     "item_ids": item_ids,
@@ -365,25 +357,6 @@ class PlanetScopeDownloader:
             order = await client.create_order(order_request)
             order_id = order['id']
             print(f"✅ Order created: {order_id}")
-            return order
-    
-    def get_order_status(self, order_id: str) -> Dict:
-        """
-        Get current order status without waiting.
-        
-        Args:
-            order_id: Order ID
-            
-        Returns:
-            Order details dictionary with current state
-        """
-        return run_async(self._async_get_order_status(order_id))
-    
-    async def _async_get_order_status(self, order_id: str) -> Dict:
-        """Async implementation of get_order_status."""
-        async with Session() as session:
-            client = session.client('orders')
-            order = await client.get_order(order_id)
             return order
     
     def wait_for_order(self, order_id: str, timeout: int = 3600) -> Dict:
@@ -484,10 +457,9 @@ class PlanetScopeDownloader:
         self,
         item_ids: List[str],
         aoi_geometry: Dict,
-        bundle_type: str = 'analytic_8b_sr_udm2',
+        bundle_type: str = 'analytic_sr_udm2',
         order_name: Optional[str] = None,
-        harmonized: bool = True,
-        gcs_delivery: Optional[Dict] = None
+        harmonized: bool = True
     ) -> Dict:
         """
         Create an order with clip tool to AOI.
@@ -504,7 +476,7 @@ class PlanetScopeDownloader:
             Order details dictionary
         """
         return run_async(self._async_create_order_with_clip(
-            item_ids, aoi_geometry, bundle_type, order_name, harmonized, gcs_delivery
+            item_ids, aoi_geometry, bundle_type, order_name, harmonized
         ))
     
     async def _async_create_order_with_clip(
@@ -513,8 +485,7 @@ class PlanetScopeDownloader:
         aoi_geometry: Dict,
         bundle_type: str,
         order_name: Optional[str],
-        harmonized: bool,
-        gcs_delivery: Optional[Dict]
+        harmonized: bool
     ) -> Dict:
         """Async implementation of create_order_with_clip."""
         if order_name is None:
@@ -525,28 +496,22 @@ class PlanetScopeDownloader:
         print(f"   Bundle type: {bundle_type}")
         print(f"   Harmonized: {harmonized}")
         
-        # Build order request with tools matching successful order structure:
-        # 1. clip, 2. harmonize, 3. composite, 4. file_format
+        # Build order request with clip, harmonize, and COG format tools
         tools = [
             {
                 "clip": {
-                    "aoi": aoi_geometry  # GeoJSON geometry - Planet API will clip to this
+                    "aoi": aoi_geometry
                 }
             }
         ]
         
-        # Add harmonization, composite, and COG format tools (matching successful order)
+        # Add harmonization and COG format tools
         if harmonized:
-            # Add harmonize tool (target sensor: Sentinel-2) - comes before composite
+            # Add harmonize tool (target sensor: Sentinel-2)
             tools.append({
                 "harmonize": {
                     "target_sensor": "Sentinel-2"
                 }
-            })
-            
-            # Add composite tool (mosaics multiple scenes into one TIF)
-            tools.append({
-                "composite": {}
             })
             
             # Add file format tool for COG
@@ -556,15 +521,10 @@ class PlanetScopeDownloader:
                 }
             })
             
-            print("   ✅ Added clip, harmonize (Sentinel-2), composite, and COG format tools")
+            print("   ✅ Added harmonization (Sentinel-2) and COG format tools")
         
-        # Build order request according to Planet Orders API documentation:
-        # https://docs.planet.com/develop/apis/orders/mechanics/
-        # Required: name, source_type, products
-        # Matches successful order structure with clip, harmonize, composite, COG
         order_request = {
             "name": order_name,
-            "source_type": "scenes",  # Required: "scenes" for PSScene items
             "products": [
                 {
                     "item_ids": item_ids,
@@ -574,13 +534,6 @@ class PlanetScopeDownloader:
             ],
             "tools": tools
         }
-        
-        # Add GCS delivery if provided
-        if gcs_delivery:
-            order_request["delivery"] = {
-                "google_cloud_storage": gcs_delivery
-            }
-            print(f"   ✅ Added GCS delivery: {gcs_delivery.get('bucket', 'N/A')}")
         
         # Create order using async API
         async with Session() as session:
