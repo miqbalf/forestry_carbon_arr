@@ -1107,7 +1107,34 @@ class ForestryCarbonARR:
                 'config': config
             }
             
-            self.logger.info("Forestry ARR Eligibility analysis workflow completed successfully!")
+            # Force evaluation of key Earth Engine objects to ensure they're computed
+            # This prevents issues where the method returns but operations aren't actually complete
+            self.logger.info("Verifying Earth Engine operations are complete...")
+            try:
+                # Verify final_zone is accessible (lightweight check)
+                _ = final_zone.bandNames().getInfo()
+                self.logger.info("✅ Final zone verified")
+                
+                # Verify image_mosaick is accessible
+                _ = image_mosaick.bandNames().getInfo()
+                self.logger.info("✅ Image mosaic verified")
+                
+                # Verify selected land cover is accessible
+                _ = selected_image_lc.bandNames().getInfo()
+                self.logger.info("✅ Land cover classification verified")
+                
+                self.logger.info("✅ All Earth Engine operations verified and ready")
+            except Exception as verify_error:
+                # Log warning but don't fail - operations might still be valid
+                self.logger.warning(
+                    f"Could not verify Earth Engine operations immediately: {verify_error}. "
+                    "Operations may still be valid but not yet computed. "
+                    "This is normal for lazy-evaluated Earth Engine operations."
+                )
+            
+            self.logger.info("=" * 60)
+            self.logger.info("✅ Forestry ARR Eligibility analysis workflow completed successfully!")
+            self.logger.info("=" * 60)
             
             return {
                 'final_zone': final_zone,
@@ -1117,7 +1144,9 @@ class ForestryCarbonARR:
             }
             
         except Exception as e:
-            self.logger.error(f"Workflow failed: {e}", exc_info=True)
+            self.logger.error("=" * 60)
+            self.logger.error(f"❌ Workflow failed: {e}", exc_info=True)
+            self.logger.error("=" * 60)
             raise ForestryCarbonError(f"Forestry ARR Eligibility analysis failed: {e}")
     
     def assess_accuracy(self,

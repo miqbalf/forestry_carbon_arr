@@ -462,6 +462,29 @@ def prepare_tsfresh_data_with_ground_truth(
     
     ds_gt_list = []
     
+    # Get dataset CRS for polygon conversion
+    dataset_crs = ds_resampled.attrs.get('crs', 'EPSG:32749')
+    if isinstance(dataset_crs, str) and dataset_crs.startswith('EPSG:'):
+        dataset_epsg = dataset_crs
+    else:
+        # Try to extract EPSG from coords if available
+        dataset_epsg = ds_resampled.coords.get('epsg', None)
+        if dataset_epsg is not None:
+            dataset_epsg = f'EPSG:{int(dataset_epsg.values)}'
+        else:
+            dataset_epsg = 'EPSG:32749'  # Default fallback
+            logger.warning(f"Could not determine dataset CRS, using default: {dataset_epsg}")
+    
+    logger.info(f"Dataset CRS: {dataset_epsg}")
+    
+    # Convert training_gdf to dataset CRS if needed (do this once before the loop)
+    if training_gdf.crs is None:
+        logger.warning("Training data has no CRS! Assuming it matches dataset CRS.")
+        training_gdf = training_gdf.set_crs(dataset_epsg, allow_override=True)
+    elif str(training_gdf.crs) != dataset_epsg:
+        logger.info(f"Converting training data from {training_gdf.crs} to {dataset_epsg}")
+        training_gdf = training_gdf.to_crs(dataset_epsg)
+    
     # Process each sample separately
     for layer_name in unique_layers:
         logger.info(f"\n{'='*60}")
@@ -471,6 +494,14 @@ def prepare_tsfresh_data_with_ground_truth(
         # 1. Get geometries for this sample
         sample_gdf = training_gdf[training_gdf['layer'] == layer_name]
         logger.info(f"  Polygons: {len(sample_gdf)}")
+        
+        # Ensure sample_gdf is in the correct CRS (should already be done above, but double-check)
+        if sample_gdf.crs is None or str(sample_gdf.crs) != dataset_epsg:
+            logger.warning(f"  Converting sample_gdf CRS from {sample_gdf.crs} to {dataset_epsg}")
+            if sample_gdf.crs is None:
+                sample_gdf = sample_gdf.set_crs(dataset_epsg, allow_override=True)
+            else:
+                sample_gdf = sample_gdf.to_crs(dataset_epsg)
         
         # 2. Get bounding box with buffer
         bounds = sample_gdf.total_bounds
