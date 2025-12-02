@@ -14,6 +14,12 @@ from numcodecs import Blosc
 from typing import Optional, Dict, Any
 import logging
 
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # Try to import gcsfs (optional dependency)
@@ -682,6 +688,22 @@ def save_dataset_efficient_zarr(
     # Clean non-serializable attributes before saving
     logger.info("Cleaning dataset attributes for zarr compatibility...")
     ds = _clean_dataset_attrs(ds)
+    
+    # Reset MultiIndex coordinates to regular coordinates (zarr cannot serialize MultiIndex)
+    # Check all indexes for MultiIndex and reset them
+    # When resetting, the MultiIndex levels (e.g., 'y', 'x' from stacking) become separate coordinate variables
+    # This preserves spatial coordinates for later matching/joining
+    if PANDAS_AVAILABLE:
+        indexes_to_reset = []
+        for index_name in list(ds.indexes.keys()):
+            index = ds.indexes[index_name]
+            if isinstance(index, pd.MultiIndex):
+                indexes_to_reset.append(index_name)
+        
+        if indexes_to_reset:
+            logger.info(f"Resetting MultiIndex coordinates {indexes_to_reset} to regular coordinates for zarr compatibility...")
+            logger.info("  MultiIndex levels will become separate coordinate variables (e.g., 'pixel_y', 'pixel_x') for spatial matching")
+            ds = ds.reset_index(indexes_to_reset)
     
     # For GEE compatibility, validate dimension ordering
     if gee_compatible:
