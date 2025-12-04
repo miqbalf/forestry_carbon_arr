@@ -23,6 +23,7 @@ import xarray as xr
 import dask.array as da
 import rasterio.features
 from affine import Affine
+from shapely.geometry import MultiPolygon, Polygon
 
 logger = logging.getLogger(__name__)
 
@@ -686,4 +687,309 @@ def prepare_tsfresh_data_with_ground_truth(
     logger.info(f"{'='*60}")
     
     return ds_gt_list
+
+
+def prepare_tsfresh_data_without_ground_truth(
+    ds_resampled: xr.Dataset,
+    aoi_border: gpd.GeoDataFrame,
+    buffer_pixels: int = 5,
+    chunk_sizes: Optional[Dict[str, int]] = None
+) -> xr.Dataset:
+    """
+    Prepare satellite data for tsfresh feature extraction WITHOUT ground truth.
+    
+    This function:
+    1. Explodes multipolygons to handle all parts correctly
+    2. Clips satellite data to AOI bounding box (with optional buffer)
+    3. Creates a mask from exact polygon boundaries
+    4. Sets pixels outside the AOI polygons to NaN
+    5. Returns a single dataset with only pixels inside the AOI
+    
+    Parameters
+    ----------
+    ds_resampled : xarray.Dataset
+        Satellite dataset with dimensions (time, x, y) or (time, X, Y)
+    aoi_border : GeoDataFrame
+        Area of interest border geometry (single or multiple polygons, multipolygons are exploded)
+    buffer_pixels : int
+        Buffer size in pixels around AOI border for initial clipping. Default 5.
+        Note: The final mask uses exact polygon boundaries (no buffer).
+    chunk_sizes : dict, optional
+        Chunk sizes for output dataset. Default: {'time': 20, 'x': 128, 'y': 128}
+    
+    Returns
+    -------
+    xarray.Dataset
+        Masked dataset with dimensions (time, x, y) and variables from ds_resampled.
+        Pixels outside the AOI polygons are set to NaN.
+        No ground_truth or eligibility variables.
+    """
+    # Normalize dimension names (handle both X/Y and x/y)
+    if 'X' in ds_resampled.dims:
+        ds_resampled = ds_resampled.rename({'X': 'x', 'Y': 'y'})
+    
+    # IMPORTANT: Standardize to STAC convention BEFORE clipping
+    logger.info("Standardizing dataset to STAC convention...")
+    ds_resampled = standardize_to_stac_convention(ds_resampled)
+    
+    if chunk_sizes is None:
+        chunk_sizes = {'time': 20, 'x': 128, 'y': 128}
+    
+    logger.info("=" * 60)
+    logger.info("Preparing tsfresh data WITHOUT ground truth")
+    logger.info("=" * 60)
+    
+    # Get dataset CRS
+    dataset_crs = ds_resampled.attrs.get('crs', 'EPSG:32749')
+    if isinstance(dataset_crs, str) and dataset_crs.startswith('EPSG:'):
+        dataset_epsg = dataset_crs
+    else:
+        dataset_epsg = ds_resampled.coords.get('epsg', None)
+        if dataset_epsg is not None:
+            dataset_epsg = f'EPSG:{int(dataset_epsg.values)}'
+        else:
+            dataset_epsg = 'EPSG:32749'
+            logger.warning(f"Could not determine dataset CRS, using default: {dataset_epsg}")
+    
+    logger.info(f"Dataset CRS: {dataset_epsg}")
+    
+    # Ensure aoi_border is in dataset CRS
+    if aoi_border.crs is None:
+        logger.warning("AOI border has no CRS! Assuming it matches dataset CRS.")
+        aoi_border = aoi_border.set_crs(dataset_epsg, allow_override=True)
+    elif str(aoi_border.crs) != dataset_epsg:
+        logger.info(f"Converting AOI border from {aoi_border.crs} to {dataset_epsg}")
+        aoi_border = aoi_border.to_crs(dataset_epsg)
+    
+    # Explode multipolygons to individual polygons to ensure all parts are included
+    # This prevents issues where multipolygon bounds might miss disconnected parts
+    logger.info("Exploding multipolygons to individual polygons...")
+    aoi_exploded = aoi_border.explode(index_parts=True)
+    n_original = len(aoi_border)
+    n_exploded = len(aoi_exploded)
+    if n_exploded > n_original:
+        logger.info(f"   Exploded {n_original} feature(s) into {n_exploded} individual polygon(s)")
+    
+    # Get bounding box with buffer (from all exploded polygons)
+    bounds = aoi_exploded.total_bounds
+    pixel_size = float(ds_resampled.x[1] - ds_resampled.x[0])
+    buffer_distance = buffer_pixels * pixel_size
+    
+    minx, miny, maxx, maxy = bounds
+    minx -= buffer_distance
+    miny -= buffer_distance
+    maxx += buffer_distance
+    maxy += buffer_distance
+    
+    logger.info(f"AOI bounds: [{minx:.2f}, {miny:.2f}, {maxx:.2f}, {maxy:.2f}]")
+    logger.info(f"Buffer: {buffer_pixels} pixels ({buffer_distance:.2f}m)")
+    
+    # Check if bbox intersects with dataset bounds
+    ds_minx = float(ds_resampled.x.min())
+    ds_maxx = float(ds_resampled.x.max())
+    ds_miny = float(ds_resampled.y.min())
+    ds_maxy = float(ds_resampled.y.max())
+    
+    # Check intersection
+    bbox_intersects = not (maxx < ds_minx or minx > ds_maxx or maxy < ds_miny or miny > ds_maxy)
+    
+    if not bbox_intersects:
+        raise ValueError(
+            f"AOI bounding box does not intersect with dataset.\n"
+            f"AOI bbox: [{minx:.2f}, {miny:.2f}, {maxx:.2f}, {maxy:.2f}]\n"
+            f"Dataset bounds: x=[{ds_minx:.2f}, {ds_maxx:.2f}], y=[{ds_miny:.2f}, {ds_maxy:.2f}]"
+        )
+    
+    # Clip ds_resampled to bbox
+    clip_minx = max(minx, ds_minx)
+    clip_maxx = min(maxx, ds_maxx)
+    clip_miny = max(miny, ds_miny)
+    clip_maxy = min(maxy, ds_maxy)
+    
+    # Find nearest coordinate indices
+    x_coords = ds_resampled.x.values
+    y_coords = ds_resampled.y.values
+    
+    # Find indices where coordinates are within bbox
+    x_mask = (x_coords >= clip_minx) & (x_coords <= clip_maxx)
+    y_mask = (y_coords <= clip_maxy) & (y_coords >= clip_miny)
+    
+    if not x_mask.any() or not y_mask.any():
+        # Try with tolerance
+        pixel_size = abs(x_coords[1] - x_coords[0]) if len(x_coords) > 1 else 10.0
+        tolerance = pixel_size / 2.0
+        
+        x_mask = (x_coords >= clip_minx - tolerance) & (x_coords <= clip_maxx + tolerance)
+        y_mask = (y_coords <= clip_maxy + tolerance) & (y_coords >= clip_miny - tolerance)
+        
+        if not x_mask.any() or not y_mask.any():
+            raise ValueError(
+                f"No coordinates found within AOI bbox.\n"
+                f"Clip bbox: [{clip_minx:.2f}, {clip_miny:.2f}, {clip_maxx:.2f}, {clip_maxy:.2f}]\n"
+                f"Dataset bounds: x=[{ds_minx:.2f}, {ds_maxx:.2f}], y=[{ds_miny:.2f}, {ds_maxy:.2f}]"
+            )
+    
+    # Get coordinate ranges
+    x_indices = np.where(x_mask)[0]
+    y_indices = np.where(y_mask)[0]
+    
+    x_start_idx = x_indices[0]
+    x_end_idx = x_indices[-1] + 1
+    y_start_idx = y_indices[0]
+    y_end_idx = y_indices[-1] + 1
+    
+    # Clip dataset
+    try:
+        ds_clipped = ds_resampled.isel(
+            x=slice(x_start_idx, x_end_idx),
+            y=slice(y_start_idx, y_end_idx)
+        )
+    except Exception as e:
+        logger.warning(f"Error with isel, trying sel: {e}")
+        try:
+            ds_clipped = ds_resampled.sel(
+                x=slice(clip_minx, clip_maxx),
+                y=slice(clip_maxy, clip_miny)  # STAC convention: y descending
+            )
+        except Exception as e2:
+            raise ValueError(f"Failed to clip dataset: {e2}")
+    
+    # Validate clipped dataset
+    if ds_clipped.sizes.get('x', 0) == 0 or ds_clipped.sizes.get('y', 0) == 0:
+        raise ValueError(f"Clipped dataset is empty. Clip bbox: [{clip_minx:.2f}, {clip_miny:.2f}, {clip_maxx:.2f}, {clip_maxy:.2f}]")
+    
+    original_size = ds_resampled.sizes['x'] * ds_resampled.sizes['y']
+    clipped_size = ds_clipped.sizes['x'] * ds_clipped.sizes['y']
+    reduction = 100 * (1 - clipped_size / original_size)
+    
+    logger.info(f"✅ Clipped dataset to bounding box:")
+    logger.info(f"   Size: {dict(ds_clipped.sizes)} ({reduction:.1f}% reduction)")
+    logger.info(f"   Variables: {list(ds_clipped.data_vars)}")
+    
+    # Now create a mask from the actual polygon boundaries (not just bbox)
+    # This will set pixels outside the AOI polygons to NaN
+    logger.info("Creating polygon mask to set pixels outside AOI to NaN...")
+    
+    # Get coordinates from clipped dataset
+    x = ds_clipped.coords['x'].values
+    y = ds_clipped.coords['y'].values
+    
+    # Calculate pixel resolution
+    res_x = (x[-1] - x[0]) / (len(x) - 1) if len(x) > 1 else abs(float(ds_clipped.x[1] - ds_clipped.x[0]))
+    res_y = (y[0] - y[-1]) / (len(y) - 1) if len(y) > 1 else abs(float(ds_clipped.y[0] - ds_clipped.y[1]))
+    
+    # Create affine transformation for rasterization
+    # For STAC convention (y descending), we need to adjust the transform
+    transform = Affine.translation(x[0] - res_x / 2, y[0] + res_y / 2) * \
+               Affine.scale(res_x, -res_y)
+    
+    # Prepare features for rasterization (all polygons get value 1)
+    # Union all exploded polygons into a single geometry for faster rasterization
+    logger.info(f"   Unioning {n_exploded} polygon(s) into single geometry...")
+    aoi_union = aoi_exploded.geometry.unary_union
+    
+    # If it's a MultiPolygon, we need to handle it differently
+    if isinstance(aoi_union, MultiPolygon):
+        # For MultiPolygon, create features for each polygon
+        features = [(geom, 1) for geom in aoi_union.geoms]
+    elif isinstance(aoi_union, Polygon):
+        # Single polygon
+        features = [(aoi_union, 1)]
+    else:
+        # Fallback: use exploded polygons directly
+        features = [(geom, 1) for geom in aoi_exploded.geometry]
+    
+    logger.info(f"   Rasterizing {len(features)} polygon(s) to create mask...")
+    
+    # Rasterize: convert vector polygons to raster grid
+    # Value 1 = inside AOI, NaN = outside AOI
+    mask_raster = rasterio.features.rasterize(
+        features,
+        out_shape=(len(y), len(x)),
+        transform=transform,
+        fill=np.nan,  # Fill outside polygons with NaN
+        dtype="float32",
+        all_touched=False  # Only pixels whose center is inside polygon
+    )
+    
+    # Convert mask to xarray DataArray
+    mask_da = xr.DataArray(
+        mask_raster,
+        dims=("y", "x"),
+        coords={
+            "y": ds_clipped.coords["y"],
+            "x": ds_clipped.coords["x"]
+        }
+    )
+    
+    # Count pixels inside and outside AOI
+    n_total_pixels = mask_da.size
+    n_inside_aoi = (~np.isnan(mask_da.values)).sum()
+    n_outside_aoi = np.isnan(mask_da.values).sum()
+    
+    logger.info(f"   Mask created:")
+    logger.info(f"      Total pixels: {n_total_pixels:,}")
+    logger.info(f"      Inside AOI: {n_inside_aoi:,} ({n_inside_aoi/n_total_pixels*100:.1f}%)")
+    logger.info(f"      Outside AOI (will be NaN): {n_outside_aoi:,} ({n_outside_aoi/n_total_pixels*100:.1f}%)")
+    
+    # Apply mask to all data variables in the dataset
+    logger.info("   Applying mask to dataset (setting pixels outside AOI to NaN)...")
+    
+    ds_masked = ds_clipped.copy()
+    for var_name in ds_masked.data_vars:
+        # Multiply by mask: pixels inside AOI keep their value, outside become NaN
+        # We need to broadcast mask to match variable dimensions (time, y, x)
+        var_data = ds_masked[var_name]
+        
+        # If variable has time dimension, broadcast mask to (time, y, x)
+        if 'time' in var_data.dims:
+            # Create mask with time dimension by using xr.align or manual broadcasting
+            # Method: expand mask along time dimension to match variable
+            # Get time coordinates from the variable
+            time_coords = var_data.time
+            
+            # Create a new mask DataArray with time dimension
+            # Use np.broadcast_to to create the array, then wrap in DataArray
+            mask_values = mask_da.values  # Shape: (y, x)
+            n_times = len(time_coords)
+            
+            # Broadcast mask to (time, y, x) - same mask for all time steps
+            mask_broadcasted = np.broadcast_to(
+                mask_values[np.newaxis, :, :],  # Add time dimension at front
+                (n_times, mask_values.shape[0], mask_values.shape[1])
+            )
+            
+            # Create DataArray with proper coordinates
+            mask_expanded = xr.DataArray(
+                mask_broadcasted,
+                dims=('time', 'y', 'x'),
+                coords={
+                    'time': time_coords,
+                    'y': mask_da.y,
+                    'x': mask_da.x
+                }
+            )
+            
+            # Apply mask: multiply by mask (NaN * value = NaN, 1 * value = value)
+            ds_masked[var_name] = var_data * mask_expanded
+        else:
+            # No time dimension, apply mask directly
+            ds_masked[var_name] = var_data * mask_da
+    
+    logger.info(f"   ✅ Mask applied to all {len(ds_masked.data_vars)} variables")
+    
+    # Apply chunking if specified
+    if chunk_sizes:
+        # Only chunk dimensions that exist and are specified
+        chunk_dict = {k: v for k, v in chunk_sizes.items() if k in ds_masked.dims}
+        if chunk_dict:
+            logger.info(f"   Applying chunking: {chunk_dict}")
+            ds_masked = ds_masked.chunk(chunk_dict)
+    
+    logger.info(f"✅ Final masked dataset:")
+    logger.info(f"   Size: {dict(ds_masked.sizes)}")
+    logger.info(f"   Pixels inside AOI: {n_inside_aoi:,}")
+    logger.info(f"   Pixels outside AOI (NaN): {n_outside_aoi:,}")
+    
+    return ds_masked
 

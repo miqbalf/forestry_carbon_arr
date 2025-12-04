@@ -1781,6 +1781,145 @@ class ForestryCarbonARR:
             self.logger.info("Skipping zarr save - returning datasets directly")
             return ds_gt_list
     
+    def prepare_tsfresh_without_ground_truth(
+        self,
+        ds_resampled: Optional['xr.Dataset'] = None,
+        aoi_border: Optional[Any] = None,
+        aoi_path: Optional[str] = None,
+        buffer_pixels: int = 5,
+        chunk_sizes: Optional[Dict[str, int]] = None,
+        save_to_zarr: bool = True,
+        zarr_path: Optional[str] = None,
+        overwrite_zarr: bool = False,
+        storage: str = 'auto'
+    ) -> 'xr.Dataset':
+        """
+        Prepare satellite data for tsfresh feature extraction WITHOUT ground truth.
+        
+        This method:
+        1. Clips satellite data to AOI border (with optional buffer)
+        2. Returns a single dataset covering the entire AOI area
+        3. Optionally saves to zarr
+        
+        Args:
+            ds_resampled: Satellite dataset from get_ds_resampled_gee(). If None, will call
+                get_ds_resampled_gee() automatically.
+            aoi_border: GeoDataFrame with AOI border geometry. Required if aoi_path is None.
+            aoi_path: Path to AOI shapefile (GCS or local). Required if aoi_border is None.
+            buffer_pixels: Buffer size in pixels around AOI border. Default 5.
+            chunk_sizes: Chunk sizes for output dataset. Default: {'time': 20, 'x': 128, 'y': 128}
+            save_to_zarr: Whether to save dataset to zarr. Default True.
+            zarr_path: Path for zarr store. If None, uses GCS_ZARR_DIR env var.
+            overwrite_zarr: Whether to overwrite existing zarr store. Default False.
+            storage: Storage type ('auto', 'local', 'gcs'). Default 'auto'.
+        
+        Returns:
+            xarray.Dataset with dimensions (time, x, y) and variables from ds_resampled
+            (no ground_truth or eligibility variables)
+        """
+        import geopandas as gpd
+        from ..utils.tsfresh_utils import (
+            prepare_tsfresh_data_without_ground_truth
+        )
+        from ..utils.zarr_utils import save_dataset_efficient_zarr, load_dataset_zarr
+        from ..core.utils import DataUtils
+        import os
+        
+        self.logger.info("=" * 60)
+        self.logger.info("Preparing tsfresh data WITHOUT ground truth")
+        self.logger.info("=" * 60)
+        
+        # Step 1: Get ds_resampled if not provided
+        if ds_resampled is None:
+            self.logger.info("ds_resampled not provided, calling get_ds_resampled_gee()...")
+            ds_resampled = self.get_ds_resampled_gee(save_to_zarr=False)
+        
+        # Step 2: Load AOI border if not provided
+        if aoi_border is None:
+            if aoi_path is None:
+                # Try to use config AOI path
+                aoi_path = self.config.get('AOI_path', None)
+                if aoi_path is None:
+                    raise ValueError("Either aoi_border, aoi_path, or config['AOI_path'] must be provided")
+            
+            self.logger.info(f"Loading AOI from: {aoi_path}")
+            data_utils = DataUtils(self.config, use_gee=True)
+            aoi_gpd, _ = data_utils.load_geodataframe_gee(aoi_path)
+            
+            # Convert to output CRS
+            output_crs = self.config.get('output_crs', 'EPSG:32749')
+            aoi_border = aoi_gpd.to_crs(output_crs)
+            self.logger.info(f"Loaded AOI: {len(aoi_border)} features")
+        else:
+            self.logger.info(f"Using provided AOI GeoDataFrame: {len(aoi_border)} features")
+        
+        # Step 3: Prepare tsfresh data without ground truth
+        self.logger.info("Clipping dataset to AOI border...")
+        ds_aoi = prepare_tsfresh_data_without_ground_truth(
+            ds_resampled=ds_resampled,
+            aoi_border=aoi_border,
+            buffer_pixels=buffer_pixels,
+            chunk_sizes=chunk_sizes
+        )
+        
+        # Step 4: Save to zarr if requested
+        if save_to_zarr:
+            self.logger.info("Saving dataset to zarr...")
+            
+            # Determine zarr path
+            if zarr_path is None:
+                zarr_path = os.getenv('GCS_ZARR_DIR', '')
+                if not zarr_path:
+                    zarr_path = os.path.join(os.getcwd(), 'data', 'tsfresh_aoi.zarr')
+                else:
+                    if not zarr_path.startswith('gs://'):
+                        zarr_path = f"gs://{zarr_path}/tsfresh_aoi.zarr"
+                    else:
+                        zarr_path = f"{zarr_path}/tsfresh_aoi.zarr"
+            
+            # Determine storage
+            if storage == 'auto':
+                storage = 'gcs' if zarr_path.startswith('gs://') else 'local'
+            
+            # Check if exists
+            zarr_exists = False
+            if storage == 'gcs':
+                try:
+                    import gcsfs
+                    fs = gcsfs.GCSFileSystem(project=os.getenv('GOOGLE_CLOUD_PROJECT'))
+                    zarr_exists = fs.exists(zarr_path)
+                except Exception:
+                    zarr_exists = False
+            else:
+                zarr_exists = os.path.exists(zarr_path)
+            
+            if zarr_exists and not overwrite_zarr:
+                self.logger.info(f"Loading existing zarr: {zarr_path}")
+                ds_aoi = load_dataset_zarr(zarr_path, storage=storage)
+            else:
+                # Save to zarr
+                if chunk_sizes is None:
+                    chunk_sizes = {'time': 20, 'x': 128, 'y': 128}
+                
+                save_dataset_efficient_zarr(
+                    ds_aoi,
+                    zarr_path,
+                    chunk_sizes=chunk_sizes,
+                    compression='lz4',
+                    compression_level=1,
+                    overwrite=overwrite_zarr,
+                    storage=storage
+                )
+                
+                # Reload to ensure consistency
+                ds_aoi = load_dataset_zarr(zarr_path, storage=storage)
+            
+            self.logger.info(f"✅ Dataset saved/loaded from zarr: {zarr_path}")
+        else:
+            self.logger.info("Skipping zarr save - returning dataset directly")
+        
+        return ds_aoi
+    
     def _apply_temporal_smoothing(self,
                                   ds: 'xr.Dataset',
                                   window_length: int = 3,
