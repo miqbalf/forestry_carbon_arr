@@ -15,6 +15,20 @@ __email__ = "muh.firdausiqbal@gmail.com"
 from .core import ForestryCarbonARR
 from .config import ConfigManager
 from .exceptions import ForestryCarbonError, DependencyError
+from .ML import (
+    prepare_config,
+    train_full_area_model,
+    save_config_ml,
+    load_model,
+    load_full_area_model,
+    evaluate_model,
+    compute_shap_feature_ranking,
+    subset_dataset_features,
+    plot_confusion_matrix,
+    plot_multiclass_roc,
+    plot_unstack_ds,
+    predict_dataset_features,
+)
 
 # Planet integration
 try:
@@ -31,6 +45,18 @@ __all__ = [
     'ConfigManager',
     'ForestryCarbonError',
     'DependencyError',
+    'prepare_config',
+    'train_full_area_model',
+    'save_config_ml',
+    'load_model',
+    'load_full_area_model',
+    'evaluate_model',
+    'compute_shap_feature_ranking',
+    'subset_dataset_features',
+    'plot_confusion_matrix',
+    'plot_multiclass_roc',
+    'plot_unstack_ds',
+    'predict_dataset_features',
 ]
 
 # Conditionally export Planet classes

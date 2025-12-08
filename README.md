@@ -177,6 +177,27 @@ The library automatically detects and uses these container paths:
 - `/usr/src/app/forestry_carbon_arr` (This library)
 - `/usr/src/app/ex_ante_lib` (Ex-ante library)
 
+## 🤖 ML Workflow (CatBoost)
+
+The CatBoost-based land-cover training flow from `02u_ML_pl_catboost_lc.ipynb` is now packaged:
+
+```python
+from forestry_carbon_arr import (
+    prepare_config,
+    train_full_area_model,
+    evaluate_model,
+    compute_shap_feature_ranking,
+)
+
+# ds must expose ds.X_features (sample, feature) and ds.y (sample,)
+config = prepare_config(model_config, plot_ids)
+model, model_path = train_full_area_model(ds, config)
+results = evaluate_model(model, ds, config)
+top_feats, shap_scores = compute_shap_feature_ranking(model, ds, top_n=30)
+```
+
+Plot helpers `plot_confusion_matrix` and `plot_multiclass_roc` are available for quick diagnostics.
+
 ## 📁 Setup Requirements
 
 ### Required Directory Structure
