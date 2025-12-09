@@ -16,6 +16,7 @@ def plot_unstack_ds(
     y: bool = False,
     y_var: str = "target",
     cmap_custom: Optional[Mapping[Union[int, str], str]] = None,
+    stack_grid: bool = False,
 ):
     """
     Visualize a stacked xarray dataset by unstacking to spatial grid.
@@ -27,21 +28,43 @@ def plot_unstack_ds(
         y: if True, render target classes using y_var
         y_var: variable name for target classes when y is True
         cmap_custom: optional mapping class_id -> color
+        stack_grid: if True, expects unstack_vars shaped (feature, y, x); will stack to (sample, feature)
     """
-    if not y:
-        band_sample = ds_stacked_formatted[unstack_vars].sel(feature=var_name_sample)
-    else:
-        band_sample = ds_stacked_formatted[y_var]
+    ds_plot = ds_stacked_formatted
+    if stack_grid and set(ds_plot[unstack_vars].dims) == {"feature", "y", "x"}:
+        arr = ds_plot[unstack_vars]
+        stacked = arr.stack(sample=("y", "x")).transpose("sample", "feature")
+        ds_plot = ds_plot.copy()
+        ds_plot = ds_plot.assign_coords(
+            coord_x=("sample", stacked["x"].values),
+            coord_y=("sample", stacked["y"].values),
+            feature=("feature", stacked["feature"].values),
+            sample=("sample", np.arange(stacked.sizes["sample"])),
+        )
+        ds_plot = ds_plot.assign({unstack_vars: stacked})
 
-    band_with_xy = band_sample.assign_coords(
-        x=("sample", ds_stacked_formatted["coord_x"].data),
-        y=("sample", ds_stacked_formatted["coord_y"].data),
-    )
-    band_grid = (
-        band_with_xy.set_index(sample=("x", "y")).unstack("sample").assign_attrs(
+    if not y:
+        band_sample = ds_plot[unstack_vars].sel(feature=var_name_sample)
+    else:
+        band_sample = ds_plot[y_var]
+
+    # Check if band_sample is already in grid format (y, x)
+    if set(band_sample.dims) == {"y", "x"}:
+        # Already in grid format, no need to unstack
+        band_grid = band_sample.assign_attrs(
             crs=str(ds_stacked_formatted.attrs.get("crs", "unknown"))
         )
-    )
+    else:
+        # In sample format, need to assign coordinates and unstack
+        band_with_xy = band_sample.assign_coords(
+            x=("sample", ds_plot["coord_x"].data),
+            y=("sample", ds_plot["coord_y"].data),
+        )
+        band_grid = (
+            band_with_xy.set_index(sample=("x", "y")).unstack("sample").assign_attrs(
+                crs=str(ds_stacked_formatted.attrs.get("crs", "unknown"))
+            )
+        )
 
     fig, ax = plt.subplots(figsize=(10, 8))
 

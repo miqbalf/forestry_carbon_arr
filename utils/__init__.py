@@ -57,10 +57,14 @@ from .stac_utils import (
     debug_stac_scene_data,
     calculate_mpc_date_range
 )
+from .geotiff_utils import (
+    convert_to_geotiff,
+    export_single_band_geotiff
+)
 
 __all__ = [
-    'DependencyManager', 
-    'PathResolver', 
+    'DependencyManager',
+    'PathResolver',
     'ConfigLoader',
     'save_dataset_efficient_zarr',
     'load_dataset_zarr',
@@ -102,5 +106,7 @@ __all__ = [
     'search_and_analyze_duplicate_stac_scenes',
     'create_unified_stac_visualization',
     'debug_stac_scene_data',
-    'calculate_mpc_date_range'
+    'calculate_mpc_date_range',
+    'convert_to_geotiff',
+    'export_single_band_geotiff'
 ]

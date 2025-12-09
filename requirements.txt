@@ -22,7 +22,6 @@ tqdm>=4.66.0
 pyyaml>=6.0.0
 python-dotenv>=1.0.0
 click>=8.1.0
-tqdm>=4.66.0
 
 # Planet API integration
 planet>=3.4.0

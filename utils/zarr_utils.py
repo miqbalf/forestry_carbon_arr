@@ -852,6 +852,6 @@ def load_dataset_zarr(
         print(f"📂 Loading dataset from zarr: {zarr_path}")
         ds = xr.open_zarr(zarr_path, consolidated=consolidated)
     
-    print(f"✅ Dataset loaded: {dict(ds.dims)}")
+    print(f"✅ Dataset loaded: {dict(ds.sizes)}")
     return ds
 
