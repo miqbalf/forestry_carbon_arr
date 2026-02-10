@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forestry_carbon_arr"
+version = "0.1.0"
+description = "A library for managing GEE_notebook_Forestry integration in forestry carbon analysis workflows"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+authors = [
+    { name = "GIS Carbon AI Team", email = "muh.firdausiqbal@gmail.com" }
+]
+urls = { Repository = "https://github.com/miqbalf/forestry_carbon_arr" }
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+]
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = "requirements.txt" }
+
+[project.optional-dependencies]
+gee = [
+    "earthengine-api>=0.1.370",
+    "geemap>=0.30.0",
+    "folium>=0.15.0",
+]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.11.0",
+    "flake8>=6.1.0",
+    "mypy>=1.7.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["forestry_carbon_arr*"]
+
+[tool.setuptools.package-data]
+forestry_carbon_arr = [
+    "config/*.json",
+    "config/*.yaml",
+    "data/*.json",
+    "data/*.csv",
+]
