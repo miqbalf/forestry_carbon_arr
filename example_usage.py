@@ -62,9 +62,12 @@ def main():
     # Run the workflow
     try:
         print("Starting Forestry ARR Eligibility analysis...")
+        # Default is_only_fcd=True: FCD + Hansen zones, no training required.
+        # Pass is_only_fcd=False to overlay ML land cover from input_training.
         result = forestry.run_eligibility(
             config=config,
-            use_gee=True  # Set to False for STAC (not yet implemented)
+            use_gee=True,
+            is_only_fcd=True,
         )
         
         # Access results
@@ -75,6 +78,7 @@ def main():
         
         print("\n✅ Workflow completed successfully!")
         print(f"Final zone type: {type(final_zone)}")
+        print(f"FCD-only: {intermediate_results.get('is_only_fcd')}")
         print(f"Algorithm used: {intermediate_results['algo_ml_selected']}")
         
         # Access visualization parameters
@@ -86,18 +90,17 @@ def main():
         print(f"  Land Cover: {metadata.get('land_cover', 'N/A')}")
         print(f"  Zone: {metadata.get('zone', 'N/A')}")
         
-        # Access training points information
-        print("\n📍 Training Points Information:")
-        training_info = intermediate_results['training_points_info']
-        print(f"  Before validation: {training_info['num_points_before_validation']} points")
-        print(f"  After validation: {training_info['num_points_after_validation']} points")
-        print(f"  Unique classes: {training_info['unique_classes']}")
-        
-        # Access actual ML training and validation points (after split/stratification)
-        ml_training = intermediate_results['ml_training_points']
-        ml_validation = intermediate_results['ml_validation_points']
-        print(f"\n  ML Training points: {ml_training.size().getInfo()} points")
-        print(f"  ML Validation points: {ml_validation.size().getInfo()} points")
+        training_info = intermediate_results.get('training_points_info')
+        if training_info:
+            print("\n📍 Training Points Information:")
+            print(f"  Before validation: {training_info['num_points_before_validation']} points")
+            print(f"  After validation: {training_info['num_points_after_validation']} points")
+            print(f"  Unique classes: {training_info['unique_classes']}")
+            
+            ml_training = intermediate_results['ml_training_points']
+            ml_validation = intermediate_results['ml_validation_points']
+            print(f"\n  ML Training points: {ml_training.size().getInfo()} points")
+            print(f"  ML Validation points: {ml_validation.size().getInfo()} points")
         
         # Example: Use visualization parameters (now direct access, no nesting)
         # vis_param_mosaic = visualization_params['mosaic']

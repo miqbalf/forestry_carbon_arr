@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 try:
     from ..config import ConfigManager
     from ..exceptions import ForestryCarbonError, DependencyError
+    from ..eligibility_mode import resolve_eligibility_mode
     from ..utils.dependency_manager import DependencyManager
     from ..utils.path_resolver import PathResolver
     from ..utils.import_manager import ImportManager
@@ -23,6 +24,7 @@ except ImportError:
     # For direct execution
     from config import ConfigManager
     from exceptions import ForestryCarbonError, DependencyError
+    from eligibility_mode import resolve_eligibility_mode
     from utils.dependency_manager import DependencyManager
     from utils.path_resolver import PathResolver
     from utils.import_manager import ImportManager
@@ -376,26 +378,29 @@ class ForestryCarbonARR:
     def run_eligibility(self, 
                         config: Dict[str, Any],
                         use_gee: bool = True,
+                        is_only_fcd: bool = True,
                         **kwargs) -> Dict[str, Any]:
         """
         Run the Forestry ARR Eligibility analysis workflow.
         
         This method implements the complete workflow from the notebook:
         1. Initialize GEE (if use_gee=True)
-        2. Load AOI and training points
+        2. Load AOI (and training points when is_only_fcd=False)
         3. Create image mosaic
         4. Calculate FCD (Forest Canopy Density)
-        5. Calculate spectral indices and normalize
-        6. OBIA segmentation
-        7. ML classification using existing training points
+        5. (ML path) Calculate spectral indices and normalize
+        6. (ML path) OBIA segmentation
+        7. (ML path) ML classification using training points
         8. Hansen historical loss analysis
-        9. Final zone assignment (FCD + ML + Hansen)
+        9. Final zone assignment:
+           - is_only_fcd=True (default): FCD thresholds + Hansen via assigning_fcd_class
+           - is_only_fcd=False: FCD + ML land cover + Hansen via assign_zone_ml
         
         Args:
             config: Configuration dictionary with all required parameters
                 Required keys:
                 - AOI_path: Path to AOI shapefile
-                - input_training: Path to training points shapefile
+                - input_training: Path to training points shapefile (required only when is_only_fcd=False)
                 - OID_field_name: Field name for AOI ID
                 - label_column: Field name for class labels in training points (default: 'code_lu')
                 - I_satellite: Satellite type ('Sentinel', 'Landsat', 'Planet', 'Custom')
@@ -422,6 +427,10 @@ class ForestryCarbonARR:
                 - ndwi_hi_planet: NDWI high threshold for Planet
             use_gee: Whether to use Google Earth Engine (True) or STAC (False)
                 Currently only use_gee=True is implemented. use_gee=False returns None.
+            is_only_fcd: If True (default), skip training/ML and use FCD+Hansen zones
+                from AssignClassZone.assigning_fcd_class as final_zone.
+                If False, require input_training and overlay ML land cover via assign_zone_ml.
+                Only applies when use_gee=True.
             **kwargs: Additional keyword arguments
                 - custom_image: ee.Image, optional
                     Custom Earth Engine Image to use instead of creating ImageCollection.
@@ -450,6 +459,7 @@ class ForestryCarbonARR:
                     - treeLoss: Direct access to tree loss mask (years 0-23, masked)
                     - minLoss: Direct access to minimum loss image
                     - list_images_classified: FCD-based classification results
+                    - is_only_fcd: Whether this run used FCD-only zone assignment
                     - fcd_classified_zone: FCD-based zone classification image (before ML overlay)
                     - zones_all_algorithms: Dictionary with zone classifications for all ML algorithms:
                         - 'rf': Zone classification using Random Forest land cover
@@ -523,14 +533,20 @@ class ForestryCarbonARR:
                             config[key] = config['fcd']['thresholds'][key]
                             self.logger.info(f"Extracted {key} from fcd.thresholds.{key}")
             
-            # Validate required config keys
-            required_keys = ['AOI_path', 'input_training', 'OID_field_name', 'date_start_end']
+            # FCD-only (default) vs ML+training overlay. Training is required only for ML.
+            eligibility_mode = resolve_eligibility_mode(is_only_fcd, config)
+            use_training = eligibility_mode['use_training']
+            required_keys = eligibility_mode['required_keys']
             missing_keys = [key for key in required_keys if key not in config]
             if missing_keys:
                 raise ForestryCarbonError(
                     f"Missing required config keys: {missing_keys}. "
                     f"Available keys: {list(config.keys())}"
                 )
+            self.logger.info(
+                f"Eligibility mode: {eligibility_mode['mode']} "
+                f"(is_only_fcd={is_only_fcd}, use_training={use_training})"
+            )
             
             # Set default values for optional parameters
             config.setdefault('IsThermal', False)
@@ -608,83 +624,87 @@ class ForestryCarbonARR:
             )
             config['AOI_img'] = AOI_img
             
-            # Step 3: Load and validate training points
-            self.logger.info("Loading training points...")
-            training_path = config['input_training']
-            
-            # Check if path exists (handle both local and GCS paths)
-            is_gcs_path = training_path.startswith('gs://')
-            if is_gcs_path:
-                # For GCS paths, check using gcsfs
-                try:
-                    import gcsfs
-                    project = os.getenv('GOOGLE_CLOUD_PROJECT')
-                    if not project:
-                        raise ForestryCarbonError(
-                            "GOOGLE_CLOUD_PROJECT environment variable not set. "
-                            "Required for GCS operations."
-                        )
-                    
-                    # Create filesystem with token support (same pattern as zarr_utils)
-                    token_path = os.getenv("GCS_TOKEN_PATH", "/usr/src/app/user_id.json")
-                    fs_kwargs = {"project": project}
-                    if token_path and os.path.exists(token_path):
-                        fs_kwargs["token"] = token_path
-                    
-                    fs = gcsfs.GCSFileSystem(**fs_kwargs)
-                    
-                    if not fs.exists(training_path):
-                        raise ForestryCarbonError(f"Training points file not found on GCS: {training_path}")
-                    
-                    self.logger.info(f"Loading training points from GCS: {training_path}")
-                    # Read shapefile from GCS using filesystem parameter
-                    training_points_gdf = gpd.read_file(training_path, filesystem=fs)
-                except ImportError:
-                    raise ForestryCarbonError(
-                        "gcsfs is required for GCS paths. Install with: pip install gcsfs"
-                    )
-                except Exception as e:
-                    raise ForestryCarbonError(f"Could not load training points from GCS: {e}")
-            else:
-                # For local paths, use standard file check
-                if not os.path.exists(training_path):
-                    raise ForestryCarbonError(f"Training points file not found: {training_path}")
-                self.logger.info(f"Loading training points from local: {training_path}")
-                training_points_gdf = gpd.GeoDataFrame.from_file(training_path)
-            
-            # Check CRS
-            if training_points_gdf.crs != config['crs_input']:
-                training_points_gdf = training_points_gdf.to_crs(config['crs_input'])
-            
-            # Get label column from config (default to 'code_lu' for backward compatibility)
+            # Step 3: Load and validate training points (ML path only)
+            training_points_ee = None
+            training_points_info = None
             label_column = config.get('label_column', 'code_lu')
-            self.logger.info(f"Using label column: {label_column}")
-            
-            # Validate label column exists in training points
-            if label_column not in training_points_gdf.columns:
-                raise ForestryCarbonError(
-                    f"Label column '{label_column}' not found in training points. "
-                    f"Available columns: {list(training_points_gdf.columns)}"
+            if use_training:
+                self.logger.info("Loading training points...")
+                training_path = config['input_training']
+                
+                # Check if path exists (handle both local and GCS paths)
+                is_gcs_path = training_path.startswith('gs://')
+                if is_gcs_path:
+                    # For GCS paths, check using gcsfs
+                    try:
+                        import gcsfs
+                        project = os.getenv('GOOGLE_CLOUD_PROJECT')
+                        if not project:
+                            raise ForestryCarbonError(
+                                "GOOGLE_CLOUD_PROJECT environment variable not set. "
+                                "Required for GCS operations."
+                            )
+                        
+                        # Create filesystem with token support (same pattern as zarr_utils)
+                        token_path = os.getenv("GCS_TOKEN_PATH", "/usr/src/app/user_id.json")
+                        fs_kwargs = {"project": project}
+                        if token_path and os.path.exists(token_path):
+                            fs_kwargs["token"] = token_path
+                        
+                        fs = gcsfs.GCSFileSystem(**fs_kwargs)
+                        
+                        if not fs.exists(training_path):
+                            raise ForestryCarbonError(f"Training points file not found on GCS: {training_path}")
+                        
+                        self.logger.info(f"Loading training points from GCS: {training_path}")
+                        # Read shapefile from GCS using filesystem parameter
+                        training_points_gdf = gpd.read_file(training_path, filesystem=fs)
+                    except ImportError:
+                        raise ForestryCarbonError(
+                            "gcsfs is required for GCS paths. Install with: pip install gcsfs"
+                        )
+                    except Exception as e:
+                        raise ForestryCarbonError(f"Could not load training points from GCS: {e}")
+                else:
+                    # For local paths, use standard file check
+                    if not os.path.exists(training_path):
+                        raise ForestryCarbonError(f"Training points file not found: {training_path}")
+                    self.logger.info(f"Loading training points from local: {training_path}")
+                    training_points_gdf = gpd.GeoDataFrame.from_file(training_path)
+                
+                # Check CRS
+                if training_points_gdf.crs != config['crs_input']:
+                    training_points_gdf = training_points_gdf.to_crs(config['crs_input'])
+                
+                self.logger.info(f"Using label column: {label_column}")
+                
+                # Validate label column exists in training points
+                if label_column not in training_points_gdf.columns:
+                    raise ForestryCarbonError(
+                        f"Label column '{label_column}' not found in training points. "
+                        f"Available columns: {list(training_points_gdf.columns)}"
+                    )
+                
+                # Validate training points - filter non-integer label values
+                def is_integer(value):
+                    return isinstance(value, int)
+                
+                training_points_gdf[label_column] = training_points_gdf[label_column].apply(
+                    lambda x: x if is_integer(x) else None
                 )
-            
-            # Validate training points - filter non-integer label values
-            def is_integer(value):
-                return isinstance(value, int)
-            
-            training_points_gdf[label_column] = training_points_gdf[label_column].apply(
-                lambda x: x if is_integer(x) else None
-            )
-            
-            training_points_ee = geemap.geopandas_to_ee(training_points_gdf)
-            
-            # Store validated training points info for reference
-            training_points_info = {
-                'training_points_ee': training_points_ee,  # Earth Engine FeatureCollection
-                'num_points_before_validation': training_points_gdf.shape[0],
-                'num_points_after_validation': training_points_gdf[label_column].notna().sum(),
-                'unique_classes': sorted(training_points_gdf[label_column].dropna().unique().tolist()) if label_column in training_points_gdf.columns else [],
-                'label_column': label_column  # Store the label column name used
-            }
+                
+                training_points_ee = geemap.geopandas_to_ee(training_points_gdf)
+                
+                # Store validated training points info for reference
+                training_points_info = {
+                    'training_points_ee': training_points_ee,
+                    'num_points_before_validation': training_points_gdf.shape[0],
+                    'num_points_after_validation': training_points_gdf[label_column].notna().sum(),
+                    'unique_classes': sorted(training_points_gdf[label_column].dropna().unique().tolist()) if label_column in training_points_gdf.columns else [],
+                    'label_column': label_column
+                }
+            else:
+                self.logger.info("Skipping training points (is_only_fcd=True); FCD-based eligibility only.")
             
             # Step 4 & 5: Calculate FCD (FCDCalc creates ImageCollection internally and optimizes calls)
             # FCDCalc now computes image_mosaick only once in __init__, avoiding duplicate processing
@@ -743,185 +763,201 @@ class ForestryCarbonARR:
             # Reuse the image mosaic from FCDCalc (already computed in __init__)
             image_mosaick = fcd_instance.image_mosaick
             
-            # Step 6: Calculate spectral indices
-            self.logger.info("Calculating spectral indices...")
-            # Use the same satellite type mapping for spectral analysis as we did for FCD
-            spectral_config = config.copy()
-            if use_custom_image and is_custom_satellite:
-                # Only override if I_satellite was 'Custom' and we detected a type
-                # If user explicitly specified Sentinel/Landsat/Planet, respect that
-                if detected_satellite is not None:
-                    spectral_config['I_satellite'] = detected_satellite
+            # Steps 6-10: spectral / OBIA / ML — only when training is used
+            image_norm_with_spectral_indices_FCD = None
+            lc = None
+            classifier = None
+            ml_training_points = None
+            ml_validation_points = None
+            vis_param_lc = None
+            legend_class_lc = None
+            selected_image_lc = None
+            algo_ml_selected = None
+            if use_training:
+                # Step 6: Calculate spectral indices
+                self.logger.info("Calculating spectral indices...")
+                # Use the same satellite type mapping for spectral analysis as we did for FCD
+                spectral_config = config.copy()
+                if use_custom_image and is_custom_satellite:
+                    # Only override if I_satellite was 'Custom' and we detected a type
+                    # If user explicitly specified Sentinel/Landsat/Planet, respect that
+                    if detected_satellite is not None:
+                        spectral_config['I_satellite'] = detected_satellite
             
-            classImageSpectral = SpectralAnalysis(image_mosaick, spectral_config)
-            pca_scale = classImageSpectral.pca_scale
+                classImageSpectral = SpectralAnalysis(image_mosaick, spectral_config)
+                pca_scale = classImageSpectral.pca_scale
             
-            ndwi_image = classImageSpectral.NDWI_func()
-            msavi2_image = classImageSpectral.MSAVI2_func()
-            mtvi2_image = classImageSpectral.MTVI2_func()
-            ndvi_image = classImageSpectral.NDVI_func()
-            vari_image = classImageSpectral.VARI_func()
+                ndwi_image = classImageSpectral.NDWI_func()
+                msavi2_image = classImageSpectral.MSAVI2_func()
+                mtvi2_image = classImageSpectral.MTVI2_func()
+                ndvi_image = classImageSpectral.NDVI_func()
+                vari_image = classImageSpectral.VARI_func()
             
-            # Add spectral indices to image
-            # Note: FCD1_1 and FCD2_1 are already selected with 'FCD' band
-            image_mosaick_all_bands = image_mosaick.addBands([
-                FCD2_1.rename('FCD2_1'),
-                FCD1_1.rename('FCD1_1')
-            ])
+                # Add spectral indices to image
+                # Note: FCD1_1 and FCD2_1 are already selected with 'FCD' band
+                image_mosaick_all_bands = image_mosaick.addBands([
+                    FCD2_1.rename('FCD2_1'),
+                    FCD1_1.rename('FCD1_1')
+                ])
             
-            image_mosaick_ndvi_ndwi_msavi2_mtvi2_vari = (
-                image_mosaick_all_bands
-                .addBands(ndwi_image)
-                .addBands(msavi2_image)
-                .addBands(mtvi2_image)
-                .addBands(ndvi_image)
-                .addBands(vari_image)
-            )
+                image_mosaick_ndvi_ndwi_msavi2_mtvi2_vari = (
+                    image_mosaick_all_bands
+                    .addBands(ndwi_image)
+                    .addBands(msavi2_image)
+                    .addBands(mtvi2_image)
+                    .addBands(ndvi_image)
+                    .addBands(vari_image)
+                )
             
-            # Step 7: Normalize images
-            self.logger.info("Normalizing images...")
-            red_norm = normalization_100(
-                image_mosaick.select(['red']), 
-                pca_scale=pca_scale, 
-                AOI=AOI
-            )
-            green_norm = normalization_100(
-                image_mosaick.select(['green']), 
-                pca_scale=pca_scale, 
-                AOI=AOI
-            )
-            blue_norm = normalization_100(
-                image_mosaick.select(['blue']), 
-                pca_scale=pca_scale, 
-                AOI=AOI
-            )
-            nir_norm = normalization_100(
-                image_mosaick.select(['nir']), 
-                pca_scale=pca_scale, 
-                AOI=AOI
-            )
+                # Step 7: Normalize images
+                self.logger.info("Normalizing images...")
+                red_norm = normalization_100(
+                    image_mosaick.select(['red']), 
+                    pca_scale=pca_scale, 
+                    AOI=AOI
+                )
+                green_norm = normalization_100(
+                    image_mosaick.select(['green']), 
+                    pca_scale=pca_scale, 
+                    AOI=AOI
+                )
+                blue_norm = normalization_100(
+                    image_mosaick.select(['blue']), 
+                    pca_scale=pca_scale, 
+                    AOI=AOI
+                )
+                nir_norm = normalization_100(
+                    image_mosaick.select(['nir']), 
+                    pca_scale=pca_scale, 
+                    AOI=AOI
+                )
             
-            image_norm = red_norm.addBands(green_norm).addBands(blue_norm).addBands(nir_norm)
+                image_norm = red_norm.addBands(green_norm).addBands(blue_norm).addBands(nir_norm)
             
-            # Normalize spectral indices
-            image_norm_ndvi = normalization_100(
-                image_mosaick_ndvi_ndwi_msavi2_mtvi2_vari.select('NDVI'),
-                pca_scale=pca_scale,
-                AOI=AOI
-            )
-            image_norm_ndwi = normalization_100(
-                image_mosaick_ndvi_ndwi_msavi2_mtvi2_vari.select('ndwi'),
-                pca_scale=pca_scale,
-                AOI=AOI
-            )
-            image_norm_msavi2 = normalization_100(
-                image_mosaick_ndvi_ndwi_msavi2_mtvi2_vari.select('msavi2'),
-                pca_scale=pca_scale,
-                AOI=AOI
-            )
-            image_norm_mtvi2 = normalization_100(
-                image_mosaick_ndvi_ndwi_msavi2_mtvi2_vari.select('MTVI2'),
-                pca_scale=pca_scale,
-                AOI=AOI
-            )
-            image_norm_vari = normalization_100(
-                image_mosaick_ndvi_ndwi_msavi2_mtvi2_vari.select('VARI'),
-                pca_scale=pca_scale,
-                AOI=AOI
-            )
+                # Normalize spectral indices
+                image_norm_ndvi = normalization_100(
+                    image_mosaick_ndvi_ndwi_msavi2_mtvi2_vari.select('NDVI'),
+                    pca_scale=pca_scale,
+                    AOI=AOI
+                )
+                image_norm_ndwi = normalization_100(
+                    image_mosaick_ndvi_ndwi_msavi2_mtvi2_vari.select('ndwi'),
+                    pca_scale=pca_scale,
+                    AOI=AOI
+                )
+                image_norm_msavi2 = normalization_100(
+                    image_mosaick_ndvi_ndwi_msavi2_mtvi2_vari.select('msavi2'),
+                    pca_scale=pca_scale,
+                    AOI=AOI
+                )
+                image_norm_mtvi2 = normalization_100(
+                    image_mosaick_ndvi_ndwi_msavi2_mtvi2_vari.select('MTVI2'),
+                    pca_scale=pca_scale,
+                    AOI=AOI
+                )
+                image_norm_vari = normalization_100(
+                    image_mosaick_ndvi_ndwi_msavi2_mtvi2_vari.select('VARI'),
+                    pca_scale=pca_scale,
+                    AOI=AOI
+                )
             
-            image_norm_with_spectral_indices = (
-                image_norm
-                .addBands(image_norm_ndvi)
-                .addBands(image_norm_ndwi)
-                .addBands(image_norm_msavi2)
-                .addBands(image_norm_mtvi2)
-                .addBands(image_norm_vari)
-            )
+                image_norm_with_spectral_indices = (
+                    image_norm
+                    .addBands(image_norm_ndvi)
+                    .addBands(image_norm_ndwi)
+                    .addBands(image_norm_msavi2)
+                    .addBands(image_norm_mtvi2)
+                    .addBands(image_norm_vari)
+                )
             
-            # Add FCD bands to normalized image (FCD1_1 and FCD2_1 are already selected with 'FCD' band)
-            image_norm_with_spectral_indices_FCD = (
-                image_norm_with_spectral_indices
-                .addBands(FCD2_1.rename('FCD2_1'))
-                .addBands(FCD1_1.rename('FCD1_1'))
-            )
+                # Add FCD bands to normalized image (FCD1_1 and FCD2_1 are already selected with 'FCD' band)
+                image_norm_with_spectral_indices_FCD = (
+                    image_norm_with_spectral_indices
+                    .addBands(FCD2_1.rename('FCD2_1'))
+                    .addBands(FCD1_1.rename('FCD1_1'))
+                )
             
-            # Step 8: OBIA Segmentation
-            self.logger.info("Performing OBIA segmentation...")
-            # Follow the exact same process as reference implementation
-            # obia = OBIASegmentation(config=config, image=image_norm_with_spectral_indices_FCD, pca_scale=pca_scale)
-            obia = OBIASegmentation(
-                config=config,
-                image=image_norm_with_spectral_indices_FCD,
-                pca_scale=pca_scale
-            )
+                # Step 8: OBIA Segmentation
+                self.logger.info("Performing OBIA segmentation...")
+                # Follow the exact same process as reference implementation
+                # obia = OBIASegmentation(config=config, image=image_norm_with_spectral_indices_FCD, pca_scale=pca_scale)
+                obia = OBIASegmentation(
+                    config=config,
+                    image=image_norm_with_spectral_indices_FCD,
+                    pca_scale=pca_scale
+                )
             
-            # clusters = obia.SNIC_cluster()['clusters']
-            clusters = obia.SNIC_cluster()['clusters']
+                # clusters = obia.SNIC_cluster()['clusters']
+                clusters = obia.SNIC_cluster()['clusters']
             
-            # object_properties_image = obia.summarize_cluster(is_include_std = False)
-            object_properties_image = obia.summarize_cluster(is_include_std=False)
+                # object_properties_image = obia.summarize_cluster(is_include_std = False)
+                object_properties_image = obia.summarize_cluster(is_include_std=False)
             
-            # make sure has all the same type of data in all bands, for exporting purpose
-            # object_properties_image = object_properties_image.clip(AOI).toFloat()
-            object_properties_image = object_properties_image.clip(AOI).toFloat()
+                # make sure has all the same type of data in all bands, for exporting purpose
+                # object_properties_image = object_properties_image.clip(AOI).toFloat()
+                object_properties_image = object_properties_image.clip(AOI).toFloat()
             
-            # Add clusters band as integer (required for reduceConnectedComponents in object-based classification)
-            # This is added AFTER toFloat() to keep clusters as integer for proper object-based classification
-            clusters_int = clusters.select('clusters').toInt().rename('clusters')
-            object_properties_image = object_properties_image.addBands(clusters_int)
+                # Add clusters band as integer (required for reduceConnectedComponents in object-based classification)
+                # This is added AFTER toFloat() to keep clusters as integer for proper object-based classification
+                clusters_int = clusters.select('clusters').toInt().rename('clusters')
+                object_properties_image = object_properties_image.addBands(clusters_int)
             
-            # Step 9: Add date analyzed to config
-            # config["date_analyzed"] = datetime.now().strftime("%Y-%m-%d")
-            config["date_analyzed"] = datetime.now().strftime("%Y-%m-%d")
+                # Step 9: Add date analyzed to config
+                # config["date_analyzed"] = datetime.now().strftime("%Y-%m-%d")
+                config["date_analyzed"] = datetime.now().strftime("%Y-%m-%d")
             
-            # Step 10: ML Classification using existing training points
-            # lc = LandcoverML(config=config,
-            #                  input_image = image_norm_with_spectral_indices_FCD,
-            #                 cluster_properties=object_properties_image,
-            #                  num_class=5, # make sure this one is align with total type landcover stratification, for a sample creation, but not for using the existing input training
-            #                 pca_scale = pca_scale)
-            self.logger.info("Running ML classification...")
-            lc = LandcoverML(
-                config=config,
-                input_image=image_norm_with_spectral_indices_FCD,
-                cluster_properties=object_properties_image,
-                pca_scale=pca_scale
-            )
+                # Step 10: ML Classification using existing training points
+                # lc = LandcoverML(config=config,
+                #                  input_image = image_norm_with_spectral_indices_FCD,
+                #                 cluster_properties=object_properties_image,
+                #                  num_class=5, # make sure this one is align with total type landcover stratification, for a sample creation, but not for using the existing input training
+                #                 pca_scale = pca_scale)
+                self.logger.info("Running ML classification...")
+                lc = LandcoverML(
+                    config=config,
+                    input_image=image_norm_with_spectral_indices_FCD,
+                    cluster_properties=object_properties_image,
+                    pca_scale=pca_scale
+                )
             
-            # Pass the already-loaded training points directly as Earth Engine FeatureCollection
-            # This avoids reloading from GCS path which can fail
-            lc.input_training = training_points_ee
+                # Pass the already-loaded training points directly as Earth Engine FeatureCollection
+                # This avoids reloading from GCS path which can fail
+                lc.input_training = training_points_ee
             
-            # Pass label_column from config to run_classifier
-            # Set ee_training_input=True since we're passing FeatureCollection directly
-            classifier = lc.run_classifier(label_column=label_column, ee_training_input=True)
+                # Pass label_column from config to run_classifier
+                # Set ee_training_input=True since we're passing FeatureCollection directly
+                classifier = lc.run_classifier(label_column=label_column, ee_training_input=True)
             
-            # Extract actual training and validation points used for ML (after split/stratification)
-            # These are the points used for training the classifier and generating confusion matrix
-            ml_training_points = classifier['training_points']  # Actual training points used by ML
-            ml_validation_points = classifier['validation_points']  # Actual validation points for confusion matrix
+                # Extract actual training and validation points used for ML (after split/stratification)
+                # These are the points used for training the classifier and generating confusion matrix
+                ml_training_points = classifier['training_points']  # Actual training points used by ML
+                ml_validation_points = classifier['validation_points']  # Actual validation points for confusion matrix
             
-            # Get land cover legend parameters (visualization params for land cover)
-            legend_lc = lc.lc_legend_param()
-            vis_param_lc = legend_lc['vis_param_lc']
-            legend_class_lc = legend_lc['legend_class']
+                # Get land cover legend parameters (visualization params for land cover)
+                legend_lc = lc.lc_legend_param()
+                vis_param_lc = legend_lc['vis_param_lc']
+                legend_class_lc = legend_lc['legend_class']
             
-            # Get selected ML algorithm result
-            algo_ml_selected = config['algo_ml_selected']
-            if algo_ml_selected == 'rf':
-                selected_image_lc = classifier['classified_image_rf']
-            elif algo_ml_selected == 'svm':
-                selected_image_lc = classifier['classified_image_svm']
-            elif algo_ml_selected == 'gbm':
-                selected_image_lc = classifier['classified_image_gbm']
-            elif algo_ml_selected == 'cart':
-                selected_image_lc = classifier['classified_image_cart']
+                # Get selected ML algorithm result
+                algo_ml_selected = config['algo_ml_selected']
+                if algo_ml_selected == 'rf':
+                    selected_image_lc = classifier['classified_image_rf']
+                elif algo_ml_selected == 'svm':
+                    selected_image_lc = classifier['classified_image_svm']
+                elif algo_ml_selected == 'gbm':
+                    selected_image_lc = classifier['classified_image_gbm']
+                elif algo_ml_selected == 'cart':
+                    selected_image_lc = classifier['classified_image_cart']
+                else:
+                    self.logger.warning(f"Unknown algorithm {algo_ml_selected}, defaulting to rf")
+                    selected_image_lc = classifier['classified_image_rf']
+                    algo_ml_selected = 'rf'
+            
+
             else:
-                self.logger.warning(f"Unknown algorithm {algo_ml_selected}, defaulting to rf")
-                selected_image_lc = classifier['classified_image_rf']
-                algo_ml_selected = 'rf'
-            
+                self.logger.info("Skipping spectral indices, OBIA, and ML (is_only_fcd=True).")
+                config["date_analyzed"] = datetime.now().strftime("%Y-%m-%d")
+
             # Step 11: Hansen Historical Loss Analysis
             self.logger.info("Analyzing Hansen historical tree loss...")
             
@@ -978,42 +1014,52 @@ class ForestryCarbonARR:
             HighForestDense = list_images_classified['HighForestDense']
             fcd_classified_zone = list_images_classified['all_zone']  # FCD-based zone classification (before ML overlay)
             
-            # Step 13: Final zone assignment (ML + FCD + Hansen) for all ML algorithms
-            self.logger.info("Computing final zone classification for all ML algorithms...")
-            
-            # Generate zone classifications for all ML algorithms
-            zones_all_algorithms = {}
-            zones_all_algorithms['rf'] = class_assigning_fcd.assign_zone_ml(
-                classifier['classified_image_rf'],
-                minLoss,
-                AOI_img,
-                HighForestDense
-            )
-            zones_all_algorithms['svm'] = class_assigning_fcd.assign_zone_ml(
-                classifier['classified_image_svm'],
-                minLoss,
-                AOI_img,
-                HighForestDense
-            )
-            zones_all_algorithms['gbm'] = class_assigning_fcd.assign_zone_ml(
-                classifier['classified_image_gbm'],
-                minLoss,
-                AOI_img,
-                HighForestDense
-            )
-            zones_all_algorithms['cart'] = class_assigning_fcd.assign_zone_ml(
-                classifier['classified_image_cart'],
-                minLoss,
-                AOI_img,
-                HighForestDense
-            )
-            
-            # Get the selected algorithm's zone
-            final_zone = zones_all_algorithms[algo_ml_selected]
-            
-            # Get visualization parameters for zones (from AssignClassZone)
+            # Step 13: Final zone — FCD+Hansen (default) or ML overlay
             vis_param_zone = class_assigning_fcd.vis_param_merged
             legend_class_zone = class_assigning_fcd.legend_class
+            zones_all_algorithms = {}
+            
+            if use_training:
+                self.logger.info("Computing final zone classification for all ML algorithms...")
+                zones_all_algorithms['rf'] = class_assigning_fcd.assign_zone_ml(
+                    classifier['classified_image_rf'],
+                    minLoss,
+                    AOI_img,
+                    HighForestDense
+                )
+                zones_all_algorithms['svm'] = class_assigning_fcd.assign_zone_ml(
+                    classifier['classified_image_svm'],
+                    minLoss,
+                    AOI_img,
+                    HighForestDense
+                )
+                zones_all_algorithms['gbm'] = class_assigning_fcd.assign_zone_ml(
+                    classifier['classified_image_gbm'],
+                    minLoss,
+                    AOI_img,
+                    HighForestDense
+                )
+                zones_all_algorithms['cart'] = class_assigning_fcd.assign_zone_ml(
+                    classifier['classified_image_cart'],
+                    minLoss,
+                    AOI_img,
+                    HighForestDense
+                )
+                final_zone = zones_all_algorithms[algo_ml_selected]
+            else:
+                self.logger.info(
+                    "Using FCD-based zone assignment (assigning_fcd_class) as final_zone."
+                )
+                final_zone = fcd_classified_zone
+                vis_param_lc = list_images_classified.get('vis_param_segment_lc')
+                legend_class_lc = {
+                    '1': {'name': 'Forest (FCD)', 'color': '#83ff5a'},
+                    '2': {'name': 'Shrubland (FCD)', 'color': '#ffe3b3'},
+                    '3': {'name': 'Grassland (FCD)', 'color': '#ffff33'},
+                    '4': {'name': 'Openland (FCD)', 'color': '#f89696'},
+                    '5': {'name': 'Water (FCD)', 'color': '#1900ff'},
+                }
+                selected_image_lc = list_images_classified.get('fcd_class_lc_image')
             
             # Extract variables for layer name generation
             I_satellite = config['I_satellite']
@@ -1055,6 +1101,12 @@ class ForestryCarbonARR:
             }
             
             # Generate standardized layer names
+            if use_training:
+                final_zone_layer = f'Final_zone_ML_{algo_ml_selected}_Hansen'
+                land_cover_selected_layer = f'{algo_ml_selected.upper()}_lc_result'
+            else:
+                final_zone_layer = f'FCD_classified_zone_{project_name}'
+                land_cover_selected_layer = 'FCD_lc_result'
             layer_names = {
                 'image_mosaick': f'{I_satellite} mosaicked - {start_date}-{end_date} VegColor',
                 'FCD1_1': f'FCD1_1_{project_name}',
@@ -1063,7 +1115,7 @@ class ForestryCarbonARR:
                 'treeLoss': 'treeLoss',
                 'minLoss': 'minLoss',
                 'fcd_classified_zone': f'FCD_classified_zone_{project_name}',
-                'final_zone': f'Final_zone_ML_{algo_ml_selected}_Hansen',
+                'final_zone': final_zone_layer,
                 'zone_rf': f'Final_zone_ML_rf_Hansen',
                 'zone_svm': f'Final_zone_ML_svm_Hansen',
                 'zone_gbm': f'Final_zone_ML_gbm_Hansen',
@@ -1072,7 +1124,7 @@ class ForestryCarbonARR:
                 'land_cover_svm': 'SVM_lc_result',
                 'land_cover_gbm': 'GBM_lc_result',
                 'land_cover_cart': 'CART_lc_result',
-                'land_cover_selected': f'{algo_ml_selected.upper()}_lc_result'
+                'land_cover_selected': land_cover_selected_layer
             }
             
             # Prepare results
@@ -1094,6 +1146,7 @@ class ForestryCarbonARR:
                 'minLoss': minLoss,  # Direct access to minLoss
                 'list_images_classified': list_images_classified,  # FCD-based classification results
                 'fcd_classified_zone': fcd_classified_zone,  # FCD-based zone classification (before ML overlay)
+                'is_only_fcd': not use_training,
                 'zones_all_algorithms': zones_all_algorithms,  # Zone classifications for all ML algorithms (rf, svm, gbm, cart)
                 'HighForestDense': HighForestDense,
                 'layer_names': layer_names  # Standardized layer names for visualization/export
@@ -1119,9 +1172,9 @@ class ForestryCarbonARR:
                 _ = image_mosaick.bandNames().getInfo()
                 self.logger.info("✅ Image mosaic verified")
                 
-                # Verify selected land cover is accessible
-                _ = selected_image_lc.bandNames().getInfo()
-                self.logger.info("✅ Land cover classification verified")
+                if selected_image_lc is not None:
+                    _ = selected_image_lc.bandNames().getInfo()
+                    self.logger.info("✅ Land cover classification verified")
                 
                 self.logger.info("✅ All Earth Engine operations verified and ready")
             except Exception as verify_error:
