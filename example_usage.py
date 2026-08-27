@@ -48,6 +48,7 @@ def main():
             'open_land': 30,
             'year_start_loss': 14,
             'tree_cover_forest': 30,
+            'hansen_gfc_asset': 'UMD/hansen/global_forest_change_2025_v1_13',
             'pixel_number': 3,
             'pca_scaling': 1,
             'super_pixel_size': 3,
@@ -68,6 +69,7 @@ def main():
             config=config,
             use_gee=True,
             is_only_fcd=True,
+            # hansen_gfc_asset='UMD/hansen/global_forest_change_2025_v1_13',
         )
         
         # Access results

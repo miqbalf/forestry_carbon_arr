@@ -59,6 +59,11 @@ DEFAULT_CONFIG = {
         "smoothing_kernel": 3
     },
     
+    # Hansen Global Forest Change — asset ID changes every yearly update
+    "hansen": {
+        "gfc_asset": "UMD/hansen/global_forest_change_2025_v1_13"
+    },
+    
     # Land cover classification
     "classification": {
         "classes": {

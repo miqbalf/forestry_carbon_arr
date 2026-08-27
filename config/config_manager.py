@@ -110,6 +110,7 @@ class ConfigManager:
             'yrf_forest': 'fcd.thresholds.yrf_forest',
             'shrub_grass': 'fcd.thresholds.shrub_grass',
             'open_land': 'fcd.thresholds.open_land',
+            'hansen_gfc_asset': 'hansen.gfc_asset',
         }
         
         # Apply mappings
@@ -138,6 +139,9 @@ class ConfigManager:
         # Also preserve date_start_end for backward compatibility
         if 'date_start_end' in flat_config:
             normalized['date_start_end'] = flat_config['date_start_end']
+        
+        if 'hansen_gfc_asset' in flat_config:
+            normalized['hansen_gfc_asset'] = flat_config['hansen_gfc_asset']
         
         return normalized
     
@@ -217,6 +221,12 @@ class ConfigManager:
                     if key not in config_copy and key in config_copy['fcd']['thresholds']:
                         config_copy[key] = config_copy['fcd']['thresholds'][key]
         
+        if 'hansen_gfc_asset' not in config_copy:
+            if 'hansen' in config_copy and isinstance(config_copy['hansen'], dict):
+                nested_gfc = config_copy['hansen'].get('gfc_asset')
+                if nested_gfc:
+                    config_copy['hansen_gfc_asset'] = nested_gfc
+        
         return config_copy
     
     def get(self, key: str, default: Any = None) -> Any:
@@ -246,6 +256,7 @@ class ConfigManager:
             'yrf_forest': 'fcd.thresholds.yrf_forest',
             'shrub_grass': 'fcd.thresholds.shrub_grass',
             'open_land': 'fcd.thresholds.open_land',
+            'hansen_gfc_asset': 'hansen.gfc_asset',
         }
         
         # If it's a flat key with a nested equivalent, check nested first

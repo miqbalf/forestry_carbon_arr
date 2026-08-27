@@ -16,6 +16,7 @@ try:
     from ..config import ConfigManager
     from ..exceptions import ForestryCarbonError, DependencyError
     from ..eligibility_mode import resolve_eligibility_mode
+    from ..hansen_gfc import hansen_lossyear_max, resolve_hansen_gfc_asset
     from ..utils.dependency_manager import DependencyManager
     from ..utils.path_resolver import PathResolver
     from ..utils.import_manager import ImportManager
@@ -25,6 +26,7 @@ except ImportError:
     from config import ConfigManager
     from exceptions import ForestryCarbonError, DependencyError
     from eligibility_mode import resolve_eligibility_mode
+    from hansen_gfc import hansen_lossyear_max, resolve_hansen_gfc_asset
     from utils.dependency_manager import DependencyManager
     from utils.path_resolver import PathResolver
     from utils.import_manager import ImportManager
@@ -53,7 +55,8 @@ class ForestryCarbonARR:
     def __init__(self, 
                  config_path: Optional[Union[str, Path, Dict]] = None,
                  gee_forestry_path: Optional[Union[str, Path]] = None,
-                 auto_setup: bool = True):
+                 auto_setup: bool = True,
+                 hansen_gfc_asset: Optional[str] = None):
         """
         Initialize Forestry Carbon ARR integration system.
         
@@ -61,12 +64,18 @@ class ForestryCarbonARR:
             config_path: Path to configuration file, config dict, or None for defaults
             gee_forestry_path: Path to GEE_notebook_Forestry directory (optional)
             auto_setup: Whether to automatically setup dependencies and paths
+            hansen_gfc_asset: Hansen GFC Earth Engine Image ID (updates yearly).
+                Example: 'UMD/hansen/global_forest_change_2025_v1_13'.
+                Overrides config if provided.
         """
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
         
         # Initialize configuration
         self.config_manager = ConfigManager(config_path)
+        if hansen_gfc_asset:
+            self.config_manager.load_config({'hansen_gfc_asset': hansen_gfc_asset})
         self.config = self.config_manager.config
+        self.hansen_gfc_asset = hansen_gfc_asset
         
         # Initialize managers
         self.dependency_manager = DependencyManager()
@@ -379,6 +388,7 @@ class ForestryCarbonARR:
                         config: Dict[str, Any],
                         use_gee: bool = True,
                         is_only_fcd: bool = True,
+                        hansen_gfc_asset: Optional[str] = None,
                         **kwargs) -> Dict[str, Any]:
         """
         Run the Forestry ARR Eligibility analysis workflow.
@@ -431,6 +441,9 @@ class ForestryCarbonARR:
                 from AssignClassZone.assigning_fcd_class as final_zone.
                 If False, require input_training and overlay ML land cover via assign_zone_ml.
                 Only applies when use_gee=True.
+            hansen_gfc_asset: Hansen GFC Earth Engine Image ID. Hansen updates yearly
+                (e.g. UMD/hansen/global_forest_change_2025_v1_13). Overrides config
+                and ForestryCarbonARR(hansen_gfc_asset=...) for this run.
             **kwargs: Additional keyword arguments
                 - custom_image: ee.Image, optional
                     Custom Earth Engine Image to use instead of creating ImageCollection.
@@ -532,6 +545,20 @@ class ForestryCarbonARR:
                         if key not in config and key in config['fcd']['thresholds']:
                             config[key] = config['fcd']['thresholds'][key]
                             self.logger.info(f"Extracted {key} from fcd.thresholds.{key}")
+            
+            if 'hansen_gfc_asset' not in config and 'hansen' in config and isinstance(config['hansen'], dict):
+                nested_gfc = config['hansen'].get('gfc_asset') or config['hansen'].get('hansen_gfc_asset')
+                if nested_gfc:
+                    config['hansen_gfc_asset'] = nested_gfc
+                    self.logger.info("Extracted hansen_gfc_asset from hansen.gfc_asset")
+            
+            resolved_gfc_asset = resolve_hansen_gfc_asset(
+                argument=hansen_gfc_asset or kwargs.get('gfc_asset'),
+                config=config,
+                instance_config=getattr(self, 'config', None),
+            )
+            config['hansen_gfc_asset'] = resolved_gfc_asset
+            self.logger.info(f"Using Hansen GFC asset: {resolved_gfc_asset}")
             
             # FCD-only (default) vs ML+training overlay. Training is required only for ML.
             eligibility_mode = resolve_eligibility_mode(is_only_fcd, config)
@@ -990,12 +1017,12 @@ class ForestryCarbonARR:
                     f"Available keys: {list(config.keys())}"
                 )
             
-            hansen_class = HansenHistorical(config)
+            hansen_class = HansenHistorical(config, gfc_asset=resolved_gfc_asset)
             run_hansen = hansen_class.initiate_tcl()
             
             treeLossYear = run_hansen['treeLossYear']
-            # Create treeLoss mask: tree loss between years 0-23 (2000-2023)
-            treeLoss = treeLossYear.gte(0).And(treeLossYear.lte(23)).selfMask()
+            lossyear_max = hansen_lossyear_max(resolved_gfc_asset)
+            treeLoss = treeLossYear.gte(0).And(treeLossYear.lte(lossyear_max)).selfMask()
             minLoss = run_hansen['minLoss']
             gfc = run_hansen['gfc']
             
