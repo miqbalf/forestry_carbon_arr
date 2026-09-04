@@ -781,11 +781,11 @@ class ForestryCarbonARR:
                 fcd_instance = FCDCalc(config)
             
             class_FCD_run = fcd_instance.fcd_calc()
-            # Select the 'FCD' band explicitly for visualization (FCD images have single 'FCD' band)
-            # FCD values can be negative or > 80, so clamp to 0-80 range for proper color visualization
-            # Clip to AOI to ensure proper visualization boundaries
-            FCD1_1 = class_FCD_run['FCD1_1'].select('FCD').clamp(0, 80).unmask(0).clip(AOI)
-            FCD2_1 = class_FCD_run['FCD2_1'].select('FCD').clamp(0, 80).unmask(0).clip(AOI)
+            # Select the 'FCD' band explicitly (FCD images have single 'FCD' band)
+            # Keep the raw FCD range (no fixed 0-80 clamp) so downstream thresholds
+            # and stats reflect the actual data; only unmask/clip to AOI.
+            FCD1_1 = class_FCD_run['FCD1_1'].select('FCD').unmask(0).clip(AOI)
+            FCD2_1 = class_FCD_run['FCD2_1'].select('FCD').unmask(0).clip(AOI)
             
             # Reuse the image mosaic from FCDCalc (already computed in __init__)
             image_mosaick = fcd_instance.image_mosaick
