@@ -832,22 +832,36 @@ def load_dataset_zarr(
     zarr_path: str,
     consolidated: bool = True,
     storage: str = 'auto',
-    gcs_project: Optional[str] = None
+    gcs_project: Optional[str] = None,
+    s3_key: Optional[str] = None,
+    s3_secret: Optional[str] = None,
+    s3_endpoint_url: Optional[str] = None
 ) -> xr.Dataset:
     """
-    Load a dataset from a zarr store located locally or on GCS.
-    
+    Load a dataset from a zarr store located locally, on GCS, or on S3-compatible storage.
+
     Parameters
     ----------
     zarr_path : str
-        Path to zarr store (local path or GCS URI like gs://bucket/path.zarr).
+        Path to zarr store (local path, GCS URI like gs://bucket/path.zarr,
+        or S3 URI like s3://bucket/path.zarr).
     consolidated : bool, optional
         Whether to use consolidated metadata. Default True.
     storage : str, optional
-        Storage type ('auto', 'local', 'gcs'). Default 'auto'.
+        Storage type ('auto', 'local', 'gcs', 's3'). Default 'auto'.
+        'auto' detects 'gs://' -> gcs, 's3://' -> s3, otherwise local.
     gcs_project : str, optional
         GCS project ID (if different from GOOGLE_CLOUD_PROJECT).
-        
+    s3_key : str, optional
+        S3-compatible access key (e.g. Hetzner Object Storage access key).
+        Falls back to the HETZNER_S3_ACCESS_KEY_ID environment variable.
+    s3_secret : str, optional
+        S3-compatible secret key. Falls back to the
+        HETZNER_S3_SECRET_ACCESS_KEY environment variable.
+    s3_endpoint_url : str, optional
+        S3-compatible endpoint URL (e.g. 'https://fsn1.your-objectstorage.com').
+        Falls back to the HETZNER_S3_ENDPOINT_URL environment variable.
+
     Returns
     -------
     xarray.Dataset
@@ -855,39 +869,68 @@ def load_dataset_zarr(
     """
     storage = storage.lower()
     if storage == 'auto':
-        storage = 'gcs' if zarr_path.startswith('gs://') else 'local'
-    if storage not in {'local', 'gcs'}:
-        raise ValueError("storage must be one of {'auto', 'local', 'gcs'}")
-    
+        if zarr_path.startswith('gs://'):
+            storage = 'gcs'
+        elif zarr_path.startswith('s3://'):
+            storage = 's3'
+        else:
+            storage = 'local'
+    if storage not in {'local', 'gcs', 's3'}:
+        raise ValueError("storage must be one of {'auto', 'local', 'gcs', 's3'}")
+
     if storage == 'gcs':
         if not GCSFS_AVAILABLE:
             raise ImportError("gcsfs is required for GCS storage. Install with: pip install gcsfs")
-        
+
         # Create a fresh GCS filesystem to avoid serialization issues
         # Always create new instance to ensure clean state
         project = gcs_project or os.getenv("GOOGLE_CLOUD_PROJECT")
         if not project:
             raise ValueError("GCS project must be specified via gcs_project parameter or GOOGLE_CLOUD_PROJECT environment variable")
-        
+
         token_path = os.getenv("GCS_TOKEN_PATH", "/usr/src/app/user_id.json")
-        
+
         # Create filesystem with explicit parameters to avoid None values
         # Only include token if file exists to avoid None in storage_options
         fs_kwargs = {"project": project}
         if token_path and os.path.exists(token_path):
             fs_kwargs["token"] = token_path
-        
+
         fs = gcsfs.GCSFileSystem(**fs_kwargs)
-        
+
         if not fs.exists(zarr_path):
             raise FileNotFoundError(f"Zarr store not found on GCS: {zarr_path}")
-        
+
         logger.info(f"Loading dataset from GCS zarr: {zarr_path}")
         print(f"📂 Loading dataset from GCS zarr: {zarr_path}")
-        
+
         # Use mapper but ensure filesystem is properly configured
         # The issue was that the filesystem had None values that couldn't be serialized
         # By creating a fresh instance with explicit kwargs, we avoid this
+        mapper = fs.get_mapper(zarr_path)
+        ds = xr.open_zarr(mapper, consolidated=consolidated)
+    elif storage == 's3':
+        if not S3FS_AVAILABLE:
+            raise ImportError("s3fs is required for S3 storage. Install with: pip install s3fs")
+
+        key = s3_key or os.getenv("HETZNER_S3_ACCESS_KEY_ID")
+        secret = s3_secret or os.getenv("HETZNER_S3_SECRET_ACCESS_KEY")
+        endpoint_url = s3_endpoint_url or os.getenv("HETZNER_S3_ENDPOINT_URL")
+        if not key or not secret:
+            raise ValueError(
+                "S3 credentials must be specified via s3_key/s3_secret parameters or "
+                "HETZNER_S3_ACCESS_KEY_ID/HETZNER_S3_SECRET_ACCESS_KEY environment variables"
+            )
+
+        # Create a fresh S3 filesystem to avoid serialization issues
+        fs = s3fs.S3FileSystem(key=key, secret=secret, endpoint_url=endpoint_url)
+
+        if not fs.exists(zarr_path):
+            raise FileNotFoundError(f"Zarr store not found on S3: {zarr_path}")
+
+        logger.info(f"Loading dataset from S3 zarr: {zarr_path}")
+        print(f"📂 Loading dataset from S3 zarr: {zarr_path}")
+
         mapper = fs.get_mapper(zarr_path)
         ds = xr.open_zarr(mapper, consolidated=consolidated)
     else:
@@ -896,7 +939,7 @@ def load_dataset_zarr(
         logger.info(f"Loading dataset from zarr: {zarr_path}")
         print(f"📂 Loading dataset from zarr: {zarr_path}")
         ds = xr.open_zarr(zarr_path, consolidated=consolidated)
-    
+
     print(f"✅ Dataset loaded: {dict(ds.sizes)}")
     return ds
 
