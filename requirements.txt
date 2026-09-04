@@ -27,6 +27,7 @@ click>=8.1.0
 # Planet API integration
 planet>=3.4.0
 gcsfs>=2023.1.0
+s3fs>=2023.1.0
 folium>=0.15.0
 
 # Optional dependencies (install with extras)

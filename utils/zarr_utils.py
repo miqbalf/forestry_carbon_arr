@@ -2,7 +2,8 @@
 Zarr utilities for saving and loading xarray datasets.
 
 This module provides functions for efficiently saving and loading xarray datasets
-to/from zarr stores, supporting both local filesystem and Google Cloud Storage.
+to/from zarr stores, supporting local filesystem, Google Cloud Storage, and
+S3-compatible object storage (e.g. Hetzner Object Storage).
 """
 
 import os
@@ -37,6 +38,13 @@ try:
 except ImportError:
     GCSFS_AVAILABLE = False
     gcs = None
+
+# Try to import s3fs (optional dependency, for S3-compatible storage e.g. Hetzner)
+try:
+    import s3fs
+    S3FS_AVAILABLE = True
+except ImportError:
+    S3FS_AVAILABLE = False
 
 
 def _format_size(size_bytes: float) -> str:
@@ -490,6 +498,9 @@ def save_dataset_efficient_zarr(
     consolidated: Optional[bool] = None,
     storage: str = 'auto',
     gcs_project: Optional[str] = None,
+    s3_key: Optional[str] = None,
+    s3_secret: Optional[str] = None,
+    s3_endpoint_url: Optional[str] = None,
     align_chunks: bool = True,
     zarr_version: Optional[int] = None,
     gee_compatible: bool = True
@@ -521,9 +532,19 @@ def save_dataset_efficient_zarr(
         If None and gee_compatible=True, defaults to True (required by GEE).
         If None and gee_compatible=False, defaults to True.
     storage : str, optional
-        Storage type ('auto', 'local', 'gcs'). Default 'auto'.
+        Storage type ('auto', 'local', 'gcs', 's3'). Default 'auto'.
+        'auto' detects 'gs://' -> gcs, 's3://' -> s3, otherwise local.
     gcs_project : str, optional
         GCS project ID (if different from GOOGLE_CLOUD_PROJECT).
+    s3_key : str, optional
+        S3-compatible access key (e.g. Hetzner Object Storage access key).
+        Falls back to the HETZNER_S3_ACCESS_KEY_ID environment variable.
+    s3_secret : str, optional
+        S3-compatible secret key. Falls back to the
+        HETZNER_S3_SECRET_ACCESS_KEY environment variable.
+    s3_endpoint_url : str, optional
+        S3-compatible endpoint URL (e.g. 'https://fsn1.your-objectstorage.com').
+        Falls back to the HETZNER_S3_ENDPOINT_URL environment variable.
     align_chunks : bool, optional
         Whether to align chunks when writing. Default True.
     zarr_version : int, optional
@@ -553,10 +574,15 @@ def save_dataset_efficient_zarr(
     storage = storage.lower()
     
     if storage == 'auto':
-        storage = 'gcs' if zarr_path.startswith('gs://') else 'local'
-    
-    if storage not in {'local', 'gcs'}:
-        raise ValueError("storage must be one of {'auto', 'local', 'gcs'}")
+        if zarr_path.startswith('gs://'):
+            storage = 'gcs'
+        elif zarr_path.startswith('s3://'):
+            storage = 's3'
+        else:
+            storage = 'local'
+
+    if storage not in {'local', 'gcs', 's3'}:
+        raise ValueError("storage must be one of {'auto', 'local', 'gcs', 's3'}")
     
     # Apply GEE-compatible defaults if requested
     if gee_compatible:
@@ -612,9 +638,28 @@ def save_dataset_efficient_zarr(
             fs_kwargs["token"] = token_path
         
         fs = gcsfs.GCSFileSystem(**fs_kwargs)
-        
+
         if overwrite and fs.exists(zarr_path):
             print(f"🗑️  Removing existing GCS zarr store: {zarr_path}")
+            fs.rm(zarr_path, recursive=True)
+    elif storage == 's3':
+        if not S3FS_AVAILABLE:
+            raise ImportError("s3fs is required for S3 storage. Install with: pip install s3fs")
+
+        key = s3_key or os.getenv("HETZNER_S3_ACCESS_KEY_ID")
+        secret = s3_secret or os.getenv("HETZNER_S3_SECRET_ACCESS_KEY")
+        endpoint_url = s3_endpoint_url or os.getenv("HETZNER_S3_ENDPOINT_URL")
+        if not key or not secret:
+            raise ValueError(
+                "S3 credentials must be specified via s3_key/s3_secret parameters or "
+                "HETZNER_S3_ACCESS_KEY_ID/HETZNER_S3_SECRET_ACCESS_KEY environment variables"
+            )
+
+        # Create a fresh S3 filesystem to avoid serialization issues
+        fs = s3fs.S3FileSystem(key=key, secret=secret, endpoint_url=endpoint_url)
+
+        if overwrite and fs.exists(zarr_path):
+            print(f"🗑️  Removing existing S3 zarr store: {zarr_path}")
             fs.rm(zarr_path, recursive=True)
     else:
         if overwrite and os.path.exists(zarr_path):
@@ -722,7 +767,7 @@ def save_dataset_efficient_zarr(
     ds_chunked = ds.chunk(chunk_sizes)
     print("💾 Writing to zarr (with automatic parallelism)...")
     
-    store = fs.get_mapper(zarr_path) if storage == 'gcs' else zarr_path
+    store = fs.get_mapper(zarr_path) if storage in ('gcs', 's3') else zarr_path
     try:
         from dask.diagnostics import ProgressBar
         with ProgressBar():
@@ -750,7 +795,7 @@ def save_dataset_efficient_zarr(
     
     # Size reporting
     total_size = None
-    if storage == 'gcs':
+    if storage in ('gcs', 's3'):
         try:
             size_info = fs.du(zarr_path)
             if isinstance(size_info, dict):
@@ -758,7 +803,7 @@ def save_dataset_efficient_zarr(
             elif isinstance(size_info, (int, float)):
                 total_size = size_info
         except Exception as exc:
-            logger.warning(f"Could not compute GCS store size: {exc}")
+            logger.warning(f"Could not compute {storage.upper()} store size: {exc}")
     else:
         if os.path.exists(zarr_path):
             total_size = 0
